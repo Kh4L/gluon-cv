@@ -8,7 +8,7 @@ from .. import experimental
 
 from ....utils import try_import_dali
 
-try_import_dali()
+dali = try_import_dali()
 
 __all__ = ['transform_test', 'load_test', 'SSDDefaultTrainTransform', 'SSDDefaultValTransform',
            'SSDDALIPipeline']

@@ -10,7 +10,7 @@ from ...utils.bbox import bbox_xywh_to_xyxy, bbox_clip_xyxy
 
 from ...utils import try_import_dali
 
-try_import_dali()
+dali = try_import_dali()
 
 __all__ = ['COCODetection', 'COCODetectionDALI']
 
@@ -229,6 +229,26 @@ class COCODetectionDALI(object):
 
         self.decode = dali.ops.HostDecoder(device="cpu", output_type=dali.types.RGB)
 
+        # We need to build the COCOReader ops to parse the annotations
+        # and have acces to the dataset size.
+        # TODO(spanev): Replace by DALI standalone ops when available
+        class DummyMicroPipe(dali.Pipeline):
+            def __init__(self):
+                super(DummyMicroPipe, self).__init__(batch_size=1,
+                                                device_id=0,
+                                                num_threads=1)
+                self.input = dali.ops.COCOReader(
+                    file_root=file_root,
+                    annotations_file=annotations_file)
+            def define_graph(self):
+                inputs, bboxes, labels = self.input(name="Reader")
+                return (inputs, bboxes, labels)
+
+        micro_pipe = DummyMicroPipe()
+        micro_pipe.build()
+        # coco_size = 118287
+        del micro_pipe
+
     def __call__(self):
         """Returns three DALI graph nodes: inputs, bboxes, labels.
         To be called in `define_graph`.
@@ -239,5 +259,4 @@ class COCODetectionDALI(object):
     def size(self):
         """Returns size of COCO dataset
         """
-        coco_size = 118287
-        return coco_size
+        return _size
