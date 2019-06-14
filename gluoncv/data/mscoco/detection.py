@@ -217,7 +217,7 @@ class COCODetectionDALI(object):
         The COCO annotation file to read from.
     """
     def __init__(self, num_shards, shard_id, file_root, annotations_file):
-        self.input = ops.COCOReader(
+        self.input = dali.ops.COCOReader(
             file_root=file_root,
             annotations_file=annotations_file,
             skip_empty=True,
@@ -227,7 +227,7 @@ class COCODetectionDALI(object):
             ltrb=True,
             shuffle_after_epoch=True)
 
-        self.decode = ops.HostDecoder(device="cpu", output_type=types.RGB)
+        self.decode = dali.ops.HostDecoder(device="cpu", output_type=dali.types.RGB)
 
     def __call__(self):
         """Returns three DALI graph nodes: inputs, bboxes, labels.
