@@ -233,10 +233,13 @@ class COCODetectionDALI(object):
         # and have acces to the dataset size.
         # TODO(spanev): Replace by DALI standalone ops when available
         class DummyMicroPipe(dali.Pipeline):
+            """ Dummy pipeline which sole purpose is to build COCOReader
+            and get the epoch size. To be replaced by DALI standalone op, when available.
+            """
             def __init__(self):
                 super(DummyMicroPipe, self).__init__(batch_size=1,
-                                                device_id=0,
-                                                num_threads=1)
+                                                     device_id=0,
+                                                     num_threads=1)
                 self.input = dali.ops.COCOReader(
                     file_root=file_root,
                     annotations_file=annotations_file)

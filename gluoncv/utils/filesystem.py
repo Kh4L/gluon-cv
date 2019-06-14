@@ -106,5 +106,6 @@ def try_import_dali():
         class dali:
             class Pipeline:
                 def __init__(self):
-                    raise NotImplementedError("DALI not found, please check if you installed it correctly.")
+                    raise NotImplementedError(
+                        "DALI not found, please check if you installed it correctly.")
     return dali
