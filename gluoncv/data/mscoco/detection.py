@@ -8,13 +8,9 @@ from .utils import try_import_pycocotools
 from ..base import VisionDataset
 from ...utils.bbox import bbox_xywh_to_xyxy, bbox_clip_xyxy
 
-try:
-    import nvidia.dali.ops as ops
-    import nvidia.dali.types as types
-except ImportError:
-    class Pipeline:
-        def __init__(self):
-            raise NotImplementedError("DALI not found, please check if you installed it correctly.")
+from ...utils import try_import_dali
+
+try_import_dali()
 
 __all__ = ['COCODetection', 'COCODetectionDALI']
 

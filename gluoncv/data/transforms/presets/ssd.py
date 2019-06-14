@@ -6,14 +6,9 @@ from .. import bbox as tbbox
 from .. import image as timage
 from .. import experimental
 
-try:
-    from nvidia.dali.pipeline import Pipeline
-    import nvidia.dali.ops as ops
-    import nvidia.dali.types as types
-except ImportError:
-    class Pipeline:
-        def __init__(self):
-            raise NotImplementedError("DALI not found, please check if you installed it correctly.")
+from ....utils import try_import_dali
+
+try_import_dali()
 
 __all__ = ['transform_test', 'load_test', 'SSDDefaultTrainTransform', 'SSDDefaultValTransform',
            'SSDDALIPipeline']

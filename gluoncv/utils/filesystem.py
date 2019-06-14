@@ -95,3 +95,16 @@ def import_try_install(package, extern_url=None):
                 sys.path.append(user_site)
             return __import__(package)
     return __import__(package)
+
+def try_import_dali()
+    """Try import NVIDIA DALI at runtime.
+    """
+    try:
+        _dali = __import__('nvidia.dali', fromlist=['pipeline', 'ops', 'types']
+        Pipeline = _dali.pipeline.Pipeline
+        ops = _dali.ops
+        types = _dali.types
+    except ImportError:
+        class Pipeline:
+            def __init__(self):
+                raise NotImplementedError("DALI not found, please check if you installed it correctly.")
