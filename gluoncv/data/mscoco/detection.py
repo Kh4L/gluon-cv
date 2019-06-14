@@ -246,7 +246,7 @@ class COCODetectionDALI(object):
 
         micro_pipe = DummyMicroPipe()
         micro_pipe.build()
-        # coco_size = 118287
+        self._size = micro_pipe.epoch_size(name="Reader")
         del micro_pipe
 
     def __call__(self):
@@ -259,4 +259,4 @@ class COCODetectionDALI(object):
     def size(self):
         """Returns size of COCO dataset
         """
-        return _size
+        return self._size
