@@ -237,9 +237,12 @@ class SSDDALIPipeline(dali.Pipeline):
     dataset_reader: float
         Partial pipeline object, which __call__ function has to return
         (images, bboxes, labels) DALI EdgeReference tuple.
+    data_layout: string
+        Layout of the data, represented by a string that has to be either
+        "NHWC" or "NCHW".
     """
     def __init__(self, num_workers, device_id, batch_size, data_shape,
-                 anchors, dataset_reader):
+                 anchors, dataset_reader, data_layout):
         super(SSDDALIPipeline, self).__init__(
             batch_size=batch_size,
             device_id=device_id,
@@ -267,6 +270,13 @@ class SSDDALIPipeline(dali.Pipeline):
         # output_dtype = types.FLOAT16 if args.fp16 else types.FLOAT
         output_dtype = dali.types.FLOAT
 
+        if data_layout == "NHWC":
+            output_layout = dali.types.NHWC
+        elif data_layout == "NCHW":
+            output_layout = dali.types.NCHW
+        else:
+            raise ValueError('output_layout has to be either "NHWC" or "NCHW"')
+
         self.normalize = dali.ops.CropMirrorNormalize(
             device="gpu",
             crop=(data_shape, data_shape),
@@ -274,7 +284,7 @@ class SSDDALIPipeline(dali.Pipeline):
             std=[0.229 * 255, 0.224 * 255, 0.225 * 255],
             mirror=0,
             output_dtype=output_dtype,
-            output_layout=dali.types.NCHW,
+            output_layout=output_layout,
             pad_output=False)
 
         # Random variables
