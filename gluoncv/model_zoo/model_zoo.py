@@ -89,6 +89,7 @@ _models = {
     'ssd_512_vgg16_atrous_custom': ssd_512_vgg16_atrous_custom,
     'ssd_512_resnet18_v1_voc': ssd_512_resnet18_v1_voc,
     'ssd_512_resnet18_v1_coco': ssd_512_resnet18_v1_coco,
+    'ssd_300_resnet34_v1_coco': ssd_300_resnet34_v1_coco,
     'ssd_512_resnet50_v1_voc': ssd_512_resnet50_v1_voc,
     'ssd_512_resnet50_v1_coco': ssd_512_resnet50_v1_coco,
     'ssd_512_resnet50_v1_custom': ssd_512_resnet50_v1_custom,

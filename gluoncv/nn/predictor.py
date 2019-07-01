@@ -31,17 +31,22 @@ class ConvPredictor(HybridBlock):
         The number of input channels to this layer.
         If not specified, initialization will be deferred to the first time forward is called and
         in_channels will be inferred from the shape of input data.
+    layout: str, default is 'NCHW'
+        Dimension ordering of data and weight. Only supports 'NCHW' and 'NHWC'
+        layout for now. 'N', 'C', 'H', 'W' stands for batch, channel, height,
+        and width dimensions respectively. Convolution is applied on the 'H' and
+        'W' dimensions.
 
     """
     def __init__(self, num_channel, kernel=(3, 3), pad=(1, 1), stride=(1, 1),
-                 activation=None, use_bias=True, in_channels=0, **kwargs):
+                 activation=None, use_bias=True, in_channels=0, layout='NCHW', **kwargs):
         super(ConvPredictor, self).__init__(**kwargs)
         with self.name_scope():
             self.predictor = nn.Conv2D(
                 num_channel, kernel, strides=stride, padding=pad,
                 activation=activation, use_bias=use_bias, in_channels=in_channels,
                 weight_initializer=mx.init.Xavier(magnitude=2),
-                bias_initializer='zeros')
+                bias_initializer='zeros', layout=layout)
 
     def hybrid_forward(self, F, x):
         return self.predictor(x)
