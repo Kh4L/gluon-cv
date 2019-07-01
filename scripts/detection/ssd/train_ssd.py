@@ -80,7 +80,7 @@ def parse_args():
                         help='Random seed to be fixed.')
     parser.add_argument('--syncbn', action='store_true',
                         help='Use synchronize BN across devices.')
-    parser.add_argument('--data_layout', type=str, default="NCHW",
+    parser.add_argument('--data-layout', type=str, default="NCHW",
                         help="Specify the input data layout. Either NCHW or NHWC")
     parser.add_argument('--dali', action='store_true',
                         help='Use DALI for data loading and data preprocessing in training. '
@@ -114,12 +114,19 @@ def get_dataset(dataset, args):
         raise NotImplementedError('Dataset: {} not implemented.'.format(dataset))
     return train_dataset, val_dataset, val_metric
 
-def get_dataloader(net, train_dataset, val_dataset, data_shape, batch_size, num_workers, ctx):
+def get_dataloader(net, train_dataset, val_dataset, data_shape, batch_size, num_workers,
+                   data_layout, ctx):
     """Get dataloader."""
     width, height = data_shape, data_shape
     # use fake data to generate fixed anchors for target generation
     with autograd.train_mode():
-        _, _, anchors = net(mx.nd.zeros((1, 3, height, width), ctx))
+        if data_layout == 'NCHW':
+            zeros_like = mx.nd.zeros((1, 3, height, width), ctx=ctx)
+        elif data_layout == 'NHWC':
+            zeros_like = mx.nd.zeros((1, height, width, 3), ctx=ctx)
+        else:
+            raise NotImplementedError("data_layout should be 'NCHW' or 'NHWC'")
+        _, _, anchors = net(zeros_like)
     anchors = anchors.as_in_context(mx.cpu())
     batchify_fn = Tuple(Stack(), Stack(), Stack())  # stack image, cls_targets, box_targets
     train_loader = gluon.data.DataLoader(
@@ -165,10 +172,16 @@ def get_dali_dataset(dataset_name, devices, args):
 
     return train_dataset, val_dataset, val_metric
 
-def get_dali_dataloader(net, train_dataset, val_dataset, devices, ctx):
+def get_dali_dataloader(net, train_dataset, val_dataset, devices, data_layout, ctx):
     width, height = args.data_shape, args.data_shape
     with autograd.train_mode():
-        _, _, anchors = net(mx.nd.zeros((1, 3, height, width), ctx=ctx))
+        if data_layout == 'NCHW':
+            zeros_like = mx.nd.zeros((1, 3, height, width), ctx=ctx)
+        elif data_layout == 'NHWC':
+            zeros_like = mx.nd.zeros((1, height, width, 3), ctx=ctx)
+        else:
+            raise NotImplementedError("data_layout should be 'NCHW' or 'NHWC'")
+        _, _, anchors = net(zeros_like)
     anchors = anchors.as_in_context(mx.cpu())
 
     if args.horovod:
@@ -380,10 +393,12 @@ if __name__ == '__main__':
     args.save_prefix += net_name
     if args.syncbn and len(ctx) > 1:
         net = get_model(net_name, pretrained_base=True, norm_layer=gluon.contrib.nn.SyncBatchNorm,
-                        norm_kwargs={'num_devices': len(ctx)})
-        async_net = get_model(net_name, pretrained_base=False)  # used by cpu worker
+                        norm_kwargs={'num_devices': len(ctx)}, layout=args.data_layout)
+        # used by cpu worker
+        async_net = get_model(net_name, pretrained_base=False, layout=args.data_layout)
     else:
-        net = get_model(net_name, pretrained_base=True, norm_layer=gluon.nn.BatchNorm)
+        net = get_model(net_name, pretrained_base=True, norm_layer=gluon.nn.BatchNorm,
+                        layout=args.data_layout)
         async_net = net
     if args.resume.strip():
         net.load_parameters(args.resume.strip())
@@ -403,12 +418,14 @@ if __name__ == '__main__':
         devices = [int(i) for i in args.gpus.split(',') if i.strip()]
         train_dataset, val_dataset, eval_metric = get_dali_dataset(args.dataset, devices, args)
         train_data, val_data = get_dali_dataloader(
-            async_net, train_dataset, val_dataset, devices, ctx[0])
+            async_net, train_dataset, val_dataset, devices,
+            args.data_layout ,ctx[0])
     else:
         train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
         batch_size = (args.batch_size // hvd.size()) if args.horovod else args.batch_size
         train_data, val_data = get_dataloader(
-            async_net, train_dataset, val_dataset, args.data_shape, batch_size, args.num_workers, ctx[0])
+            async_net, train_dataset, val_dataset, args.data_shape, batch_size, args.num_workers,
+            args.data_layout, ctx[0])
 
 
 

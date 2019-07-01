@@ -12,6 +12,9 @@ from mxnet.gluon import HybridBlock, SymbolBlock
 from mxnet.symbol import Symbol
 from mxnet.symbol.contrib import SyncBatchNorm
 
+# helpers
+def _get_bn_axis_for(layout):
+    return layout.find('C')
 
 def _parse_network(network, outputs, inputs, pretrained, ctx, **kwargs):
     """Parse network with specified outputs and other arguments.
@@ -130,9 +133,10 @@ class FeatureExpander(SymbolBlock):
 
     def __init__(self, network, outputs, num_filters, use_1x1_transition=True,
                  use_bn=True, reduce_ratio=1.0, min_depth=128, global_pool=False,
-                 pretrained=False, ctx=mx.cpu(), inputs=('data',), **kwargs):
+                 pretrained=False, ctx=mx.cpu(), inputs=('data',),
+                 layout='NCHW', **kwargs):
         inputs, outputs, params = _parse_network(
-            network, outputs, inputs, pretrained, ctx, **kwargs)
+            network, outputs, inputs, pretrained, ctx, layout=layout, **kwargs)
         # append more layers
         y = outputs[-1]
         weight_init = mx.init.Xavier(rnd_type='gaussian', factor_type='out', magnitude=2)
@@ -141,18 +145,25 @@ class FeatureExpander(SymbolBlock):
                 num_trans = max(min_depth, int(round(f * reduce_ratio)))
                 y = mx.sym.Convolution(
                     y, num_filter=num_trans, kernel=(1, 1), no_bias=use_bn,
-                    name='expand_trans_conv{}'.format(i), attr={'__init__': weight_init})
+                    name='expand_trans_conv{}'.format(i), attr={'__init__': weight_init},
+                    layout=layout)
                 if use_bn:
-                    y = mx.sym.BatchNorm(y, name='expand_trans_bn{}'.format(i))
+                    y = mx.sym.BatchNorm(y, name='expand_trans_bn{}'.format(i),
+                                         axis=_get_bn_axis_for(layout))
                 y = mx.sym.Activation(y, act_type='relu', name='expand_trans_relu{}'.format(i))
             y = mx.sym.Convolution(
                 y, num_filter=f, kernel=(3, 3), pad=(1, 1), stride=(2, 2),
-                no_bias=use_bn, name='expand_conv{}'.format(i), attr={'__init__': weight_init})
+                no_bias=use_bn, name='expand_conv{}'.format(i), attr={'__init__': weight_init},
+                layout=layout)
             if use_bn:
-                y = mx.sym.BatchNorm(y, name='expand_bn{}'.format(i))
+                y = mx.sym.BatchNorm(y, name='expand_bn{}'.format(i),
+                                     axis=_get_bn_axis_for(layout))
             y = mx.sym.Activation(y, act_type='relu', name='expand_reu{}'.format(i))
             outputs.append(y)
         if global_pool:
+            # Need NHWC to NCHW, since mxnet.symbol.Pooling is NCHW only
+            if layout == 'NHWC':
+                raise NotImplementedError("mxnet.symbol.Pooling is NCHW only")
             outputs.append(mx.sym.Pooling(y, pool_type='avg', global_pool=True, kernel=(1, 1)))
         super(FeatureExpander, self).__init__(outputs, inputs, params)
 

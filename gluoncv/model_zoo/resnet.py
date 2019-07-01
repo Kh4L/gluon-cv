@@ -37,9 +37,21 @@ from mxnet.gluon import nn
 from mxnet.gluon.nn import BatchNorm
 
 # Helpers
-def _conv3x3(channels, stride, in_channels):
+def _conv3x3(channels, stride, in_channels, layout='NCHW'):
     return nn.Conv2D(channels, kernel_size=3, strides=stride, padding=1,
-                     use_bias=False, in_channels=in_channels)
+                     use_bias=False, in_channels=in_channels, layout=layout)
+
+def _get_bn_axis_for(layout):
+    return layout.find('C')
+
+# Needed since AdaptiveAvgPooling2D is NCHW only
+def _generic_AdaptiveAvgPooling2D(F, x, output_size, layout):
+    if layout == 'NHWC':
+        x = F.transpose(x, axes=(0, 3, 1, 2))
+    x = F.contrib.AdaptiveAvgPooling2D(x, output_size=1)
+    if layout == 'NHWC':
+        x = F.transpose(x, axes=(0, 2, 3, 1))
+    return x
 
 
 # Blocks
@@ -68,19 +80,24 @@ class BasicBlockV1(HybridBlock):
     norm_kwargs : dict
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    layout: str, default is 'NCHW'
+        Dimension ordering of data and weight.
     """
     def __init__(self, channels, stride, downsample=False, in_channels=0,
-                 last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+                 last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None,
+                 layout='NCHW', **kwargs):
         super(BasicBlockV1, self).__init__(**kwargs)
         self.body = nn.HybridSequential(prefix='')
-        self.body.add(_conv3x3(channels, stride, in_channels))
-        self.body.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
+        self.body.add(_conv3x3(channels, stride, in_channels, layout=layout))
+        self.body.add(norm_layer(axis=_get_bn_axis_for(layout),
+                                 **({} if norm_kwargs is None else norm_kwargs)))
         self.body.add(nn.Activation('relu'))
-        self.body.add(_conv3x3(channels, 1, channels))
+        self.body.add(_conv3x3(channels, 1, channels, layout=layout))
         if not last_gamma:
-            self.body.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
+            self.body.add(norm_layer(axis=_get_bn_axis_for(layout),
+                                     **({} if norm_kwargs is None else norm_kwargs)))
         else:
-            self.body.add(norm_layer(gamma_initializer='zeros',
+            self.body.add(norm_layer(axis=_get_bn_axis_for(layout), gamma_initializer='zeros',
                                      **({} if norm_kwargs is None else norm_kwargs)))
 
         if use_se:
@@ -95,8 +112,10 @@ class BasicBlockV1(HybridBlock):
         if downsample:
             self.downsample = nn.HybridSequential(prefix='')
             self.downsample.add(nn.Conv2D(channels, kernel_size=1, strides=stride,
-                                          use_bias=False, in_channels=in_channels))
-            self.downsample.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
+                                          use_bias=False, in_channels=in_channels,
+                                          layout=layout))
+            self.downsample.add(norm_layer(axis=_get_bn_axis_for(layout),
+                                           **({} if norm_kwargs is None else norm_kwargs)))
         else:
             self.downsample = None
 
@@ -106,7 +125,6 @@ class BasicBlockV1(HybridBlock):
         x = self.body(x)
 
         if self.se:
-            w = F.contrib.AdaptiveAvgPooling2D(x, output_size=1)
             w = self.se(w)
             x = F.broadcast_mul(x, w.expand_dims(axis=2).expand_dims(axis=2))
 
@@ -143,18 +161,23 @@ class BottleneckV1(HybridBlock):
     norm_kwargs : dict
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    layout: str, default is 'NCHW'
+        Dimension ordering of data and weight.
     """
     def __init__(self, channels, stride, downsample=False, in_channels=0,
-                 last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+                 last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None,
+                 layout='NCHW', **kwargs):
         super(BottleneckV1, self).__init__(**kwargs)
         self.body = nn.HybridSequential(prefix='')
-        self.body.add(nn.Conv2D(channels//4, kernel_size=1, strides=stride))
-        self.body.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
+        self.body.add(nn.Conv2D(channels//4, kernel_size=1, strides=stride, layout=layout))
+        self.body.add(norm_layer(axis=_get_bn_axis_for(layout),
+                                 **({} if norm_kwargs is None else norm_kwargs)))
         self.body.add(nn.Activation('relu'))
-        self.body.add(_conv3x3(channels//4, 1, channels//4))
-        self.body.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
+        self.body.add(_conv3x3(channels//4, 1, channels//4, layout=layout))
+        self.body.add(norm_layer(axis=_get_bn_axis_for(layout),
+                                 **({} if norm_kwargs is None else norm_kwargs)))
         self.body.add(nn.Activation('relu'))
-        self.body.add(nn.Conv2D(channels, kernel_size=1, strides=1))
+        self.body.add(nn.Conv2D(channels, kernel_size=1, strides=1, layout=layout))
 
         if use_se:
             self.se = nn.HybridSequential(prefix='')
@@ -166,18 +189,22 @@ class BottleneckV1(HybridBlock):
             self.se = None
 
         if not last_gamma:
-            self.body.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
+            self.body.add(norm_layer(axis=_get_bn_axis_for(layout),
+                                     **({} if norm_kwargs is None else norm_kwargs)))
         else:
-            self.body.add(norm_layer(gamma_initializer='zeros',
+            self.body.add(norm_layer(axis=_get_bn_axis_for(layout), gamma_initializer='zeros',
                                      **({} if norm_kwargs is None else norm_kwargs)))
 
         if downsample:
             self.downsample = nn.HybridSequential(prefix='')
             self.downsample.add(nn.Conv2D(channels, kernel_size=1, strides=stride,
-                                          use_bias=False, in_channels=in_channels))
-            self.downsample.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
+                                          use_bias=False, in_channels=in_channels,
+                                          layout=layout))
+            self.downsample.add(norm_layer(axis=_get_bn_axis_for(layout),
+                                           **({} if norm_kwargs is None else norm_kwargs)))
         else:
             self.downsample = None
+        self.layout = layout
 
     def hybrid_forward(self, F, x):
         residual = x
@@ -185,7 +212,7 @@ class BottleneckV1(HybridBlock):
         x = self.body(x)
 
         if self.se:
-            w = F.contrib.AdaptiveAvgPooling2D(x, output_size=1)
+            w = _generic_AdaptiveAvgPooling2D(F, x, output_size=1, layout=self.layout)
             w = self.se(w)
             x = F.broadcast_mul(x, w.expand_dims(axis=2).expand_dims(axis=2))
 
@@ -222,19 +249,24 @@ class BasicBlockV2(HybridBlock):
     norm_kwargs : dict
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    layout: str, default is 'NCHW'
+        Dimension ordering of data and weight.
     """
     def __init__(self, channels, stride, downsample=False, in_channels=0,
                  last_gamma=False, use_se=False,
-                 norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+                 norm_layer=BatchNorm, norm_kwargs=None,
+                 layout='NCHW', **kwargs):
         super(BasicBlockV2, self).__init__(**kwargs)
-        self.bn1 = norm_layer(**({} if norm_kwargs is None else norm_kwargs))
-        self.conv1 = _conv3x3(channels, stride, in_channels)
+        self.bn1 = norm_layer(axis=_get_bn_axis_for(layout),
+                              **({} if norm_kwargs is None else norm_kwargs))
+        self.conv1 = _conv3x3(channels, stride, in_channels, layout=layout)
         if not last_gamma:
-            self.bn2 = norm_layer(**({} if norm_kwargs is None else norm_kwargs))
-        else:
-            self.bn2 = norm_layer(gamma_initializer='zeros',
+            self.bn2 = norm_layer(axis=_get_bn_axis_for(layout),
                                   **({} if norm_kwargs is None else norm_kwargs))
-        self.conv2 = _conv3x3(channels, 1, channels)
+        else:
+            self.bn2 = norm_layer(axis=_get_bn_axis_for(layout), gamma_initializer='zeros',
+                                  **({} if norm_kwargs is None else norm_kwargs))
+        self.conv2 = _conv3x3(channels, 1, channels, layout=layout)
 
         if use_se:
             self.se = nn.HybridSequential(prefix='')
@@ -247,9 +279,10 @@ class BasicBlockV2(HybridBlock):
 
         if downsample:
             self.downsample = nn.Conv2D(channels, 1, stride, use_bias=False,
-                                        in_channels=in_channels)
+                                        in_channels=in_channels, layout=layout)
         else:
             self.downsample = None
+        self.layout = layout
 
     def hybrid_forward(self, F, x):
         residual = x
@@ -264,7 +297,7 @@ class BasicBlockV2(HybridBlock):
         x = self.conv2(x)
 
         if self.se:
-            w = F.contrib.AdaptiveAvgPooling2D(x, output_size=1)
+            w = _generic_AdaptiveAvgPooling2D(F, x, output_size=1, layout=self.layout)
             w = self.se(w)
             x = F.broadcast_mul(x, w.expand_dims(axis=2).expand_dims(axis=2))
 
@@ -297,20 +330,27 @@ class BottleneckV2(HybridBlock):
     norm_kwargs : dict
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    layout: str, default is 'NCHW'
+        Dimension ordering of data and weight.
     """
     def __init__(self, channels, stride, downsample=False, in_channels=0,
-                 last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+                 last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None,
+                 layout='NCHW', **kwargs):
         super(BottleneckV2, self).__init__(**kwargs)
-        self.bn1 = norm_layer(**({} if norm_kwargs is None else norm_kwargs))
-        self.conv1 = nn.Conv2D(channels//4, kernel_size=1, strides=1, use_bias=False)
-        self.bn2 = norm_layer(**({} if norm_kwargs is None else norm_kwargs))
-        self.conv2 = _conv3x3(channels//4, stride, channels//4)
+        self.bn1 = norm_layer(axis=_get_bn_axis_for(layout),
+                              **({} if norm_kwargs is None else norm_kwargs))
+        self.conv1 = nn.Conv2D(channels//4, kernel_size=1, strides=1, use_bias=False,
+                               layout=layout)
+        self.bn2 = norm_layer(axis=_get_bn_axis_for(layout),
+                              **({} if norm_kwargs is None else norm_kwargs))
+        self.conv2 = _conv3x3(channels//4, stride, channels//4, layout=layout)
         if not last_gamma:
-            self.bn3 = norm_layer(**({} if norm_kwargs is None else norm_kwargs))
-        else:
-            self.bn3 = norm_layer(gamma_initializer='zeros',
+            self.bn3 = norm_layer(axis=_get_bn_axis_for(layout),
                                   **({} if norm_kwargs is None else norm_kwargs))
-        self.conv3 = nn.Conv2D(channels, kernel_size=1, strides=1, use_bias=False)
+        else:
+            self.bn3 = norm_layer(axis=_get_bn_axis_for(layout), gamma_initializer='zeros',
+                                  **({} if norm_kwargs is None else norm_kwargs))
+        self.conv3 = nn.Conv2D(channels, kernel_size=1, strides=1, use_bias=False, layout=layout)
 
         if use_se:
             self.se = nn.HybridSequential(prefix='')
@@ -323,9 +363,10 @@ class BottleneckV2(HybridBlock):
 
         if downsample:
             self.downsample = nn.Conv2D(channels, 1, stride, use_bias=False,
-                                        in_channels=in_channels)
+                                        in_channels=in_channels, layout=layout)
         else:
             self.downsample = None
+        self.layout = layout
 
     def hybrid_forward(self, F, x):
         residual = x
@@ -344,7 +385,7 @@ class BottleneckV2(HybridBlock):
         x = self.conv3(x)
 
         if self.se:
-            w = F.contrib.AdaptiveAvgPooling2D(x, output_size=1)
+            w = _generic_AdaptiveAvgPooling2D(F, x, output_size=1, layout=self.layout)
             w = self.se(w)
             x = F.broadcast_mul(x, w.expand_dims(axis=2).expand_dims(axis=2))
 
@@ -379,42 +420,50 @@ class ResNetV1(HybridBlock):
     norm_kwargs : dict
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    layout: str, default is 'NCHW'
+        Dimension ordering of data and weight.
     """
     def __init__(self, block, layers, channels, classes=1000, thumbnail=False,
-                 last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+                 last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None,
+                 layout='NCHW', **kwargs):
         super(ResNetV1, self).__init__(**kwargs)
         assert len(layers) == len(channels) - 1
         with self.name_scope():
             self.features = nn.HybridSequential(prefix='')
             if thumbnail:
-                self.features.add(_conv3x3(channels[0], 1, 0))
+                self.features.add(_conv3x3(channels[0], 1, 0, layout=layout))
             else:
-                self.features.add(nn.Conv2D(channels[0], 7, 2, 3, use_bias=False))
-                self.features.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
+                self.features.add(nn.Conv2D(channels[0], 7, 2, 3, use_bias=False, layout=layout))
+                self.features.add(norm_layer(axis=_get_bn_axis_for(layout),
+                                             **({} if norm_kwargs is None else norm_kwargs)))
                 self.features.add(nn.Activation('relu'))
-                self.features.add(nn.MaxPool2D(3, 2, 1))
+                self.features.add(nn.MaxPool2D(3, 2, 1, layout=layout))
 
             for i, num_layer in enumerate(layers):
                 stride = 1 if i == 0 else 2
                 self.features.add(self._make_layer(block, num_layer, channels[i+1],
                                                    stride, i+1, in_channels=channels[i],
                                                    last_gamma=last_gamma, use_se=use_se,
-                                                   norm_layer=norm_layer, norm_kwargs=norm_kwargs))
-            self.features.add(nn.GlobalAvgPool2D())
+                                                   norm_layer=norm_layer, norm_kwargs=norm_kwargs,
+                                                   layout=layout))
+            self.features.add(nn.GlobalAvgPool2D(layout=layout))
 
             self.output = nn.Dense(classes, in_units=channels[-1])
 
     def _make_layer(self, block, layers, channels, stride, stage_index, in_channels=0,
-                    last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None):
+                    last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None,
+                    layout='NCHW'):
         layer = nn.HybridSequential(prefix='stage%d_'%stage_index)
         with layer.name_scope():
             layer.add(block(channels, stride, channels != in_channels, in_channels=in_channels,
                             last_gamma=last_gamma, use_se=use_se, prefix='',
-                            norm_layer=norm_layer, norm_kwargs=norm_kwargs))
+                            norm_layer=norm_layer, norm_kwargs=norm_kwargs,
+                            layout=layout))
             for _ in range(layers-1):
                 layer.add(block(channels, 1, False, in_channels=channels,
                                 last_gamma=last_gamma, use_se=use_se, prefix='',
-                                norm_layer=norm_layer, norm_kwargs=norm_kwargs))
+                                norm_layer=norm_layer, norm_kwargs=norm_kwargs,
+                                layout=layout))
         return layer
 
     def hybrid_forward(self, F, x):
@@ -451,22 +500,26 @@ class ResNetV2(HybridBlock):
     norm_kwargs : dict
         Additional `norm_layer` arguments, for example `num_devices=4`
         for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    layout: str, default is 'NCHW'
+        Dimension ordering of data and weight.
     """
     def __init__(self, block, layers, channels, classes=1000, thumbnail=False,
-                 last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None, **kwargs):
+                 last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None,
+                 layout='NCHW', **kwargs):
         super(ResNetV2, self).__init__(**kwargs)
         assert len(layers) == len(channels) - 1
         with self.name_scope():
             self.features = nn.HybridSequential(prefix='')
-            self.features.add(norm_layer(scale=False, center=False,
+            self.features.add(norm_layer(axis=_get_bn_axis_for(layout), scale=False, center=False,
                                          **({} if norm_kwargs is None else norm_kwargs)))
             if thumbnail:
-                self.features.add(_conv3x3(channels[0], 1, 0))
+                self.features.add(_conv3x3(channels[0], 1, 0, layout=layout))
             else:
-                self.features.add(nn.Conv2D(channels[0], 7, 2, 3, use_bias=False))
-                self.features.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
+                self.features.add(nn.Conv2D(channels[0], 7, 2, 3, use_bias=False, layout=layout))
+                self.features.add(norm_layer(axis=_get_bn_axis_for(layout),
+                                             **({} if norm_kwargs is None else norm_kwargs)))
                 self.features.add(nn.Activation('relu'))
-                self.features.add(nn.MaxPool2D(3, 2, 1))
+                self.features.add(nn.MaxPool2D(3, 2, 1, layout=layout))
 
             in_channels = channels[0]
             for i, num_layer in enumerate(layers):
@@ -474,26 +527,31 @@ class ResNetV2(HybridBlock):
                 self.features.add(self._make_layer(block, num_layer, channels[i+1],
                                                    stride, i+1, in_channels=in_channels,
                                                    last_gamma=last_gamma, use_se=use_se,
-                                                   norm_layer=norm_layer, norm_kwargs=norm_kwargs))
+                                                   norm_layer=norm_layer, norm_kwargs=norm_kwargs,
+                                                   layout=layout))
                 in_channels = channels[i+1]
-            self.features.add(norm_layer(**({} if norm_kwargs is None else norm_kwargs)))
+            self.features.add(norm_layer(axis=_get_bn_axis_for(layout),
+                                         **({} if norm_kwargs is None else norm_kwargs)))
             self.features.add(nn.Activation('relu'))
-            self.features.add(nn.GlobalAvgPool2D())
+            self.features.add(nn.GlobalAvgPool2D(layout=layout))
             self.features.add(nn.Flatten())
 
             self.output = nn.Dense(classes, in_units=in_channels)
 
     def _make_layer(self, block, layers, channels, stride, stage_index, in_channels=0,
-                    last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None):
+                    last_gamma=False, use_se=False, norm_layer=BatchNorm, norm_kwargs=None,
+                    layout='NCHW'):
         layer = nn.HybridSequential(prefix='stage%d_'%stage_index)
         with layer.name_scope():
             layer.add(block(channels, stride, channels != in_channels, in_channels=in_channels,
                             last_gamma=last_gamma, use_se=use_se, prefix='',
-                            norm_layer=norm_layer, norm_kwargs=norm_kwargs))
+                            norm_layer=norm_layer, norm_kwargs=norm_kwargs,
+                            layout=layout))
             for _ in range(layers-1):
                 layer.add(block(channels, 1, False, in_channels=channels,
                                 last_gamma=last_gamma, use_se=use_se, prefix='',
-                                norm_layer=norm_layer, norm_kwargs=norm_kwargs))
+                                norm_layer=norm_layer, norm_kwargs=norm_kwargs,
+                                layout=layout))
         return layer
 
     def hybrid_forward(self, F, x):
