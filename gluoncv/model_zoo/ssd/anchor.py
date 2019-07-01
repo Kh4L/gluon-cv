@@ -27,16 +27,19 @@ class SSDAnchorGenerator(gluon.HybridBlock):
         anchor map so we can skip re-generating anchors for each input.
     offsets : tuple of float
         Center offsets of anchor boxes as (h, w) in range(0, 1).
+    layout: str, default is 'NCHW'
+        Dimension ordering of data and weight.
 
     """
     def __init__(self, index, im_size, sizes, ratios, step, alloc_size=(128, 128),
-                 offsets=(0.5, 0.5), clip=False, **kwargs):
+                 offsets=(0.5, 0.5), clip=False, layout='NCHW', **kwargs):
         super(SSDAnchorGenerator, self).__init__(**kwargs)
         assert len(im_size) == 2
         self._im_size = im_size
         self._clip = clip
         self._sizes = (sizes[0], np.sqrt(sizes[0] * sizes[1]))
         self._ratios = ratios
+        self._layout = layout
         anchors = self._generate_anchors(self._sizes, self._ratios, step, alloc_size, offsets)
         self.anchors = self.params.get_constant('anchor_%d'%(index), anchors)
 
@@ -67,7 +70,10 @@ class SSDAnchorGenerator(gluon.HybridBlock):
 
     # pylint: disable=arguments-differ
     def hybrid_forward(self, F, x, anchors):
-        a = F.slice_like(anchors, x * 0, axes=(2, 3))
+        x = (x*0)
+        if self._layout == 'NHWC':
+            x = x.transpose((0, 3, 1, 2))
+        a = F.slice_like(anchors, x, axes=(2, 3))
         a = a.reshape((1, -1, 4))
         if self._clip:
             cx, cy, cw, ch = a.split(axis=-1, num_outputs=4)
