@@ -205,7 +205,7 @@ class SSDDefaultValTransform(object):
         Mean pixel values to be subtracted from image tensor. Default is [0.485, 0.456, 0.406].
     std : array-like of size 3
         Standard deviation to be divided from image. Default is [0.229, 0.224, 0.225].
-    data_layout: string
+    layout: string
         Layout of the data, represented by a string that has to be either
         "NHWC" or "NCHW".
 
@@ -361,3 +361,72 @@ class SSDDALIPipeline(dali.Pipeline):
         bboxes, labels = self.box_encoder(bboxes, labels)
 
         return (images, bboxes.gpu(), labels.gpu())
+
+class SSDSyntheticLoader:
+    """Synthetic loader for SSD.
+
+    Parameters
+    ----------
+    anchors : mxnet.nd.NDArray
+        Anchors generated from SSD networks, the shape must be ``(1, N, 4)``.
+        Since anchors are shared in the entire batch so it is ``1`` for the first dimension.
+        ``N`` is the number of anchors for each image.
+
+        .. hint::
+
+            If anchors is ``None``, the transformation will not generate training targets.
+            Otherwise it will generate training targets to accelerate the training phase
+            since we push some workload to CPU workers instead of GPUs.
+    batch_size:
+        Batch size.
+    data_wh: int
+        Height and width length. (height==width in SSD)
+    ctx: Context list
+        List of MXNet contexts
+    layout: string
+        Layout of the data, represented by a string that has to be either
+        "NHWC" or "NCHW".
+    """
+    def __init__(self, anchors, batch_size, data_wh, ctx, epoch_size=420000, layout='NCHW'):
+        self._data = []
+        self._box_targets = []
+        self._cls_targets = []
+        for c in ctx:
+            if layout == 'NCHW':
+                data_shape = (batch_size, 3, data_wh, data_wh)
+            else:
+                data_shape = (batch_size, data_wh, data_wh, 3)
+            self._data.append(
+                    mx.nd.random.uniform(-1, 1, shape=data_shape, ctx=c))
+            anc = anchors.as_in_context(c)
+            box_target = anc.repeat(repeats=batch_size, axis=0)
+            cls_target = mx.nd.sample_multinomial(mx.nd.array([0.95, 0.05]),
+                                                   shape=box_target.shape[:2],
+                                                   dtype='float32')
+            cls_target = cls_target.as_in_context(c)
+            self._box_targets.append(box_target)
+            self._cls_targets.append(cls_target)
+        self.size = epoch_size // batch_size
+        self.i = 0
+
+    def __next__(self):
+        """
+        Returns the next batch of data.
+        """
+        if self.i >= self.size:
+            self.i = 0
+            raise StopIteration
+        self.i += 1
+        return (self._data, self._box_targets, self._cls_targets)
+
+    def next(self):
+        """
+        Returns the next batch of data.
+        """
+        return self.__next__()
+
+    def __iter__(self):
+        """
+        Returns the iterator.
+        """
+        return self

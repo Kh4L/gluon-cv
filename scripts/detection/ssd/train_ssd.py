@@ -17,6 +17,7 @@ from gluoncv.data.batchify import Tuple, Stack, Pad
 from gluoncv.data.transforms.presets.ssd import SSDDefaultTrainTransform
 from gluoncv.data.transforms.presets.ssd import SSDDefaultValTransform
 from gluoncv.data.transforms.presets.ssd import SSDDALIPipeline
+from gluoncv.data.transforms.presets.ssd import SSDSyntheticLoader
 
 from gluoncv.utils.metrics.voc_detection import VOC07MApMetric
 from gluoncv.utils.metrics.coco_detection import COCODetectionMetric
@@ -84,12 +85,14 @@ def parse_args():
                         help="Specify the input data layout. Either NCHW or NHWC")
     parser.add_argument('--dali', action='store_true',
                         help='Use DALI for data loading and data preprocessing in training. '
-                        'Currently supports only COCO.')
+                        'Currently supports only COCO. Mutually exclusive with --synthetic.')
     parser.add_argument('--amp', action='store_true',
                         help='Use MXNet AMP for mixed precision training.')
     parser.add_argument('--horovod', action='store_true',
                         help='Use MXNet Horovod for distributed training. Must be run with OpenMPI. '
                         '--gpus is ignored when using --horovod.')
+    parser.add_argument('--synthetic', action='store_true',
+                        help="Use synthetic input data. Mutually exclusive with --dali.")
 
     args = parser.parse_args()
     return args
@@ -171,6 +174,21 @@ def get_dali_dataset(dataset_name, devices, args):
         raise NotImplementedError('Dataset: {} not implemented with DALI.'.format(dataset_name))
 
     return train_dataset, val_dataset, val_metric
+
+def get_synthetic_dataloader(data_shape, data_layout, batch_size, ctx):
+    width, height = data_shape, data_shape
+    # use fake data to generate fixed anchors for target generation
+    with autograd.train_mode():
+        if data_layout == 'NCHW':
+            zeros_like = mx.nd.zeros((1, 3, height, width), ctx=ctx[0])
+        elif data_layout == 'NHWC':
+            zeros_like = mx.nd.zeros((1, height, width, 3), ctx=ctx[0])
+        else:
+            raise NotImplementedError("data_layout should be 'NCHW' or 'NHWC'")
+        _, _, anchors = net(zeros_like)
+    anchors = anchors.as_in_context(mx.cpu())
+    train_loader = SSDSyntheticLoader(anchors, batch_size, data_shape, ctx, layout=data_layout)
+    return train_loader, _ , _
 
 def get_dali_dataloader(net, train_dataset, val_dataset, devices, data_layout, ctx):
     width, height = args.data_shape, args.data_shape
@@ -319,7 +337,8 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                 data = [d.data[0] for d in batch]
                 box_targets = [d.label[0] for d in batch]
                 cls_targets = [nd.cast(d.label[1], dtype='float32') for d in batch]
-
+            elif args.synthetic:
+                data, box_targets, cls_targets = batch
             else:
                 data = gluon.utils.split_and_load(batch[0], ctx_list=ctx, batch_axis=0)
                 cls_targets = gluon.utils.split_and_load(batch[1], ctx_list=ctx, batch_axis=0)
@@ -354,7 +373,7 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                         epoch, i, args.batch_size/(time.time()-btic), name1, loss1, name2, loss2))
                 btic = time.time()
 
-        if (not args.horovod or hvd.rank() == 0):
+        if (not args.horovod or hvd.rank() == 0) and not args.synthetic:
             name1, loss1 = ce_metric.get()
             name2, loss2 = smoothl1_metric.get()
             logger.info('[Epoch {}] Training cost: {:.3f}, {}={:.3f}, {}={:.3f}'.format(
@@ -411,6 +430,7 @@ if __name__ == '__main__':
             # needed for net to be first gpu when using AMP
             net.collect_params().reset_ctx(ctx[0])
 
+    assert not (args.synthetic and args.dali), "--dali and --synthetic are mutually exclusive."
     # training data
     if args.dali:
         if not dali_found:
@@ -420,6 +440,13 @@ if __name__ == '__main__':
         train_data, val_data = get_dali_dataloader(
             async_net, train_dataset, val_dataset, devices,
             args.data_layout ,ctx[0])
+    elif args.synthetic:
+        if args.horovod:
+            local_batch_size = args.batch_size // hvd.size()
+        else:
+            local_batch_size = args.batch_size // len(ctx)
+        train_data, val_data, eval_metric = get_synthetic_dataloader(args.data_shape,
+                                    args.data_layout, local_batch_size, ctx)
     else:
         train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
         batch_size = (args.batch_size // hvd.size()) if args.horovod else args.batch_size
