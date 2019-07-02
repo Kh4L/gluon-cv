@@ -123,16 +123,20 @@ class SSDDefaultTrainTransform(object):
         IOU overlap threshold for maximum matching, default is 0.5.
     box_norm : array-like of size 4, default is (0.1, 0.1, 0.2, 0.2)
         Std value to be divided from encoded values.
+    data_layout: string
+        Layout of the data, represented by a string that has to be either
+        "NHWC" or "NCHW".
 
     """
     def __init__(self, width, height, anchors=None, mean=(0.485, 0.456, 0.406),
                  std=(0.229, 0.224, 0.225), iou_thresh=0.5, box_norm=(0.1, 0.1, 0.2, 0.2),
-                 **kwargs):
+                 layout='NCHW', **kwargs):
         self._width = width
         self._height = height
         self._anchors = anchors
         self._mean = mean
         self._std = std
+        self._is_nhwc = (layout == 'NHWC')
         if anchors is None:
             return
 
@@ -171,7 +175,10 @@ class SSDDefaultTrainTransform(object):
         bbox = tbbox.flip(bbox, (w, h), flip_x=flips[0])
 
         # to tensor
-        img = mx.nd.image.to_tensor(img)
+        if self._is_nhwc:
+            img = img / 255
+        else:
+            img = mx.nd.image.to_tensor(img)
         img = mx.nd.image.normalize(img, mean=self._mean, std=self._std)
 
         if self._anchors is None:
@@ -198,13 +205,18 @@ class SSDDefaultValTransform(object):
         Mean pixel values to be subtracted from image tensor. Default is [0.485, 0.456, 0.406].
     std : array-like of size 3
         Standard deviation to be divided from image. Default is [0.229, 0.224, 0.225].
+    data_layout: string
+        Layout of the data, represented by a string that has to be either
+        "NHWC" or "NCHW".
 
     """
-    def __init__(self, width, height, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)):
+    def __init__(self, width, height, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225),
+                 layout='NCHW'):
         self._width = width
         self._height = height
         self._mean = mean
         self._std = std
+        self._is_nhwc = (layout == 'NHWC')
 
     def __call__(self, src, label):
         """Apply transform to validation image/label."""
@@ -213,7 +225,10 @@ class SSDDefaultValTransform(object):
         img = timage.imresize(src, self._width, self._height, interp=9)
         bbox = tbbox.resize(label, in_size=(w, h), out_size=(self._width, self._height))
 
-        img = mx.nd.image.to_tensor(img)
+        if self._is_nhwc:
+            img = img / 255
+        else:
+            img = mx.nd.image.to_tensor(img)
         img = mx.nd.image.normalize(img, mean=self._mean, std=self._std)
         return img, bbox.astype(img.dtype)
 
