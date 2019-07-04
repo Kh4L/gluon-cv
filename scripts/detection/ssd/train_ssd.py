@@ -87,12 +87,15 @@ def parse_args():
                         help='Use DALI for data loading and data preprocessing in training. '
                         'Currently supports only COCO. Mutually exclusive with --synthetic.')
     parser.add_argument('--amp', action='store_true',
-                        help='Use MXNet AMP for mixed precision training.')
+                        help='Use MXNet AMP for mixed precision training.  Mutually exclusive '
+                        'with --fp16.')
     parser.add_argument('--horovod', action='store_true',
                         help='Use MXNet Horovod for distributed training. Must be run with OpenMPI. '
                         '--gpus is ignored when using --horovod.')
     parser.add_argument('--synthetic', action='store_true',
                         help="Use synthetic input data. Mutually exclusive with --dali.")
+    parser.add_argument('--fp16', action='store_true',
+                    help="Half precision training. Mutually exclusive with --amp.")
 
     args = parser.parse_args()
     return args
@@ -175,19 +178,21 @@ def get_dali_dataset(dataset_name, devices, args):
 
     return train_dataset, val_dataset, val_metric
 
-def get_synthetic_dataloader(data_shape, data_layout, batch_size, ctx):
+def get_synthetic_dataloader(data_shape, data_layout, batch_size, fp16, ctx):
     width, height = data_shape, data_shape
     # use fake data to generate fixed anchors for target generation
     with autograd.train_mode():
+        dtype = 'float16' if fp16 else 'float32'
         if data_layout == 'NCHW':
-            zeros_like = mx.nd.zeros((1, 3, height, width), ctx=ctx[0])
+            zeros_like = mx.nd.zeros((1, 3, height, width), ctx=ctx[0], dtype=dtype)
         elif data_layout == 'NHWC':
-            zeros_like = mx.nd.zeros((1, height, width, 3), ctx=ctx[0])
+            zeros_like = mx.nd.zeros((1, height, width, 3), ctx=ctx[0], dtype=dtype)
         else:
             raise NotImplementedError("data_layout should be 'NCHW' or 'NHWC'")
         _, _, anchors = net(zeros_like)
     anchors = anchors.as_in_context(mx.cpu())
-    train_loader = SSDSyntheticLoader(anchors, batch_size, data_shape, ctx, layout=data_layout)
+    train_loader = SSDSyntheticLoader(anchors, batch_size, data_shape, ctx,
+                                      layout=data_layout, fp16=fp16)
     return train_loader, _ , _
 
 def get_dali_dataloader(net, train_dataset, val_dataset, devices, data_layout, ctx):
@@ -287,11 +292,17 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
         hvd.broadcast_parameters(net.collect_params(), root_rank=0)
         trainer = hvd.DistributedTrainer(
                         net.collect_params(), 'sgd',
-                        {'learning_rate': args.lr, 'wd': args.wd, 'momentum': args.momentum})
+                        {'learning_rate': args.lr,
+                         'wd': args.wd,
+                         'momentum': args.momentum,
+                         'multi_precision': args.fp16})
     else:
         trainer = gluon.Trainer(
                     net.collect_params(), 'sgd',
-                    {'learning_rate': args.lr, 'wd': args.wd, 'momentum': args.momentum},
+                    {'learning_rate': args.lr,
+                    'wd': args.wd,
+                    'momentum': args.momentum,
+                    'multi_precision': args.fp16},
                     update_on_kvstore=(False if args.amp else None))
 
     if args.amp:
@@ -349,8 +360,10 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                 box_preds = []
                 for x in data:
                     cls_pred, box_pred, _ = net(x)
-                    cls_preds.append(cls_pred)
-                    box_preds.append(box_pred)
+                    # computing loss in fp32 because some ops like argsort does not support fp16
+                    dtype = 'float32'
+                    cls_preds.append(cls_pred.astype(dtype=dtype))
+                    box_preds.append(box_pred.astype(dtype=dtype))
                 sum_loss, cls_loss, box_loss = mbox_loss(
                     cls_preds, box_preds, cls_targets, box_targets)
                 if args.amp:
@@ -391,6 +404,9 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
 if __name__ == '__main__':
     args = parse_args()
 
+    assert not (args.synthetic and args.dali), "--dali and --synthetic are mutually exclusive."
+    assert not (args.amp and args.fp16), "--amp and --fp16 are mutually exclusive."
+
     if args.amp:
         amp.init()
 
@@ -418,6 +434,13 @@ if __name__ == '__main__':
     else:
         net = get_model(net_name, pretrained_base=True, norm_layer=gluon.nn.BatchNorm,
                         layout=args.data_layout)
+        if args.fp16:
+            # symbol.BN gamma, beta, *_mean and * need to stay in fp32
+            for param_name, param in net.collect_params().items():
+                if not param_name.endswith(('gamma','beta',
+                                     'moving_mean','moving_var',
+                                     'running_mean', 'running_var')):
+                    param.cast('float16')
         async_net = net
     if args.resume.strip():
         net.load_parameters(args.resume.strip())
@@ -430,7 +453,6 @@ if __name__ == '__main__':
             # needed for net to be first gpu when using AMP
             net.collect_params().reset_ctx(ctx[0])
 
-    assert not (args.synthetic and args.dali), "--dali and --synthetic are mutually exclusive."
     # training data
     if args.dali:
         if not dali_found:
@@ -446,7 +468,7 @@ if __name__ == '__main__':
         else:
             local_batch_size = args.batch_size // len(ctx)
         train_data, val_data, eval_metric = get_synthetic_dataloader(args.data_shape,
-                                    args.data_layout, local_batch_size, ctx)
+                                    args.data_layout, local_batch_size, args.fp16, ctx)
     else:
         train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
         batch_size = (args.batch_size // hvd.size()) if args.horovod else args.batch_size

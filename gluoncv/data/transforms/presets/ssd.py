@@ -383,26 +383,30 @@ class SSDSyntheticLoader:
         Height and width length. (height==width in SSD)
     ctx: Context list
         List of MXNet contexts
-    layout: string
+    layout: string, optional
         Layout of the data, represented by a string that has to be either
         "NHWC" or "NCHW".
+    fp16: boolean, optional
+        Load image data in half precision.
     """
-    def __init__(self, anchors, batch_size, data_wh, ctx, epoch_size=420000, layout='NCHW'):
+    def __init__(self, anchors, batch_size, data_wh, ctx, epoch_size=420000, layout='NCHW',
+                 fp16=False):
         self._data = []
         self._box_targets = []
         self._cls_targets = []
+        data_type = 'float16' if fp16 else 'float32'
         for c in ctx:
             if layout == 'NCHW':
                 data_shape = (batch_size, 3, data_wh, data_wh)
             else:
                 data_shape = (batch_size, data_wh, data_wh, 3)
             self._data.append(
-                    mx.nd.random.uniform(-1, 1, shape=data_shape, ctx=c))
+                    mx.nd.random.uniform(-1, 1, shape=data_shape, ctx=c, dtype=data_type))
             anc = anchors.as_in_context(c)
-            box_target = anc.repeat(repeats=batch_size, axis=0)
+            box_target = anc.repeat(repeats=batch_size, axis=0).astype('float32')
             cls_target = mx.nd.sample_multinomial(mx.nd.array([0.95, 0.05]),
-                                                   shape=box_target.shape[:2],
-                                                   dtype='float32')
+                                                  shape=box_target.shape[:2],
+                                                  dtype='float32')
             cls_target = cls_target.as_in_context(c)
             self._box_targets.append(box_target)
             self._cls_targets.append(cls_target)
