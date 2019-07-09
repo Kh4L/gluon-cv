@@ -10,9 +10,14 @@ from .. import bbox as tbbox
 from .. import image as timage
 from .. import mask as tmask
 
+from ....utils import try_import_dali
+
+dali = try_import_dali()
+
 __all__ = ['transform_test', 'load_test',
            'FasterRCNNDefaultTrainTransform', 'FasterRCNNDefaultValTransform',
-           'MaskRCNNDefaultTrainTransform', 'MaskRCNNDefaultValTransform']
+           'MaskRCNNDefaultTrainTransform', 'MaskRCNNDefaultValTransform',
+           'FasterRCNNDALIPipeline']
 
 
 def transform_test(imgs, short=600, max_size=1000, mean=(0.485, 0.456, 0.406),
@@ -429,3 +434,87 @@ class MaskRCNNDefaultValTransform(object):
         img = mx.nd.image.to_tensor(img)
         img = mx.nd.image.normalize(img, mean=self._mean, std=self._std)
         return img, mx.nd.array([img.shape[-2], img.shape[-1], im_scale])
+
+
+class FasterRCNNDALIPipeline(dali.Pipeline):
+    """DALI Pipeline with COCO Reader and Faster-RCNN training transform.
+
+    Parameters
+      Parameters
+    ----------
+    device_id: int
+         DALI pipeline arg - Device id.
+    num_workers:
+        DALI pipeline arg - Number of CPU workers.
+    batch_size:
+        Batch size.
+    anchors: float list
+        Normalized [ltrb] anchors generated from SSD networks.
+        The shape length be ``N*4`` since it is a list of the N anchors that have
+        all 4 float elements.
+    dataset_reader: float
+        Partial pipeline object, which __call__ function has to return
+        (images, bboxes, labels) DALI EdgeReference tuple.
+    short: int/tuple, default is 600
+        Resize image shorter side to ``short``.
+    max_size : int, default is 1000
+        Make sure image longer side is smaller than ``max_size``.
+    """
+    def __init__(self, num_workers, device_id, batch_size,
+                 anchors, dataset_reader, short=600, max_size=1000):
+        super(FasterRCNNDALIPipeline, self).__init__(
+            batch_size=batch_size,
+            device_id=device_id,
+            num_threads=num_workers)
+
+        self.dataset_reader = dataset_reader
+
+        # Augumentation techniques
+        self.resize = dali.ops.Resize(
+            device="gpu",
+            resize_shorter=short,
+            max_size=max_size,
+            min_filter=dali.types.DALIInterpType.INTERP_TRIANGULAR)
+
+        # output_dtype = dali.types.FLOAT16 if args.fp16 else dali.types.FLOAT
+        output_dtype = dali.types.FLOAT
+
+        # TODO(spanev) "gpu" NewCropMirrorNormalize is available for GPU
+        self.normalize = dali.ops.CropMirrorNormalize(
+            device="gpu",
+            mean=[0.485 * 255, 0.456 * 255, 0.406 * 255],
+            std=[0.229 * 255, 0.224 * 255, 0.225 * 255],
+            mirror=0,
+            output_dtype=output_dtype,
+            output_layout=dali.types.NCHW,
+            pad_output=False)
+
+        self.flip = dali.ops.Flip(device="gpu")
+        self.bbflip = dali.ops.BbFlip(device="cpu", ltrb=True)
+        self.flip_coin = dali.ops.CoinFlip(probability=0.5)
+
+        #self.box_encoder = dali.ops.BoxEncoder(
+        #    device="cpu",
+        #    criteria=0.5,
+        #    anchors=anchors,
+        #    offset=True,
+        #    stds=[0.1, 0.1, 0.2, 0.2],
+        #    scale=data_shape)
+
+
+    def define_graph(self):
+        """
+        Define the DALI graph.
+        """
+        coin_rnd = self.flip_coin()
+
+        images, bboxes, labels = self.dataset_reader()
+
+        images = self.flip(images, horizontal=coin_rnd)
+        bboxes = self.bbflip(bboxes, horizontal=coin_rnd)
+        images = self.resize(images.gpu())
+        images = self.normalize(images)
+        #encoded_bboxes, encoded_cls = self.box_encoder(bboxes, labels)
+
+        #return (images.gpu(), bboxes.gpu(), labels.gpu(), encoded_bboxes.gpu(), encoded_cls.gpu())
+        return (images, bboxes.gpu(), labels.gpu())

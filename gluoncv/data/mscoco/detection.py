@@ -215,8 +215,10 @@ class COCODetectionDALI(object):
         Directory containing the COCO dataset.
     annotations_file
         The COCO annotation file to read from.
+    gpu_decoder
+        If the images should be decoded with nvJPEGDecoder instead of HostDecoder.
     """
-    def __init__(self, num_shards, shard_id, file_root, annotations_file):
+    def __init__(self, num_shards, shard_id, file_root, annotations_file, gpu_decoder=False):
         self.input = dali.ops.COCOReader(
             file_root=file_root,
             annotations_file=annotations_file,
@@ -227,7 +229,11 @@ class COCODetectionDALI(object):
             ltrb=True,
             shuffle_after_epoch=True)
 
-        self.decode = dali.ops.HostDecoder(device="cpu", output_type=dali.types.RGB)
+        if not gpu_decoder:
+            self.decode = dali.ops.HostDecoder(device="cpu", output_type=dali.types.RGB)
+        else:
+            self.decode = dali.ops.nvJPEGDecoder(device="mixed", output_type=dali.types.RGB)
+        self._gpu_decoder = gpu_decoder
 
         # We need to build the COCOReader ops to parse the annotations
         # and have acces to the dataset size.
@@ -263,3 +269,7 @@ class COCODetectionDALI(object):
         """Returns size of COCO dataset
         """
         return self._size
+    def gpu_decoder(self):
+        """If the decoded images are on the GPU.
+        """
+        return self._gpu_decoder

@@ -6,19 +6,33 @@ import os
 os.environ['MXNET_CUDNN_AUTOTUNE_DEFAULT'] = '0'
 import logging
 import time
+import copy
 import numpy as np
 import mxnet as mx
+from mxnet import nd
 from mxnet import gluon
 from mxnet import autograd
 import gluoncv as gcv
 from gluoncv import data as gdata
 from gluoncv import utils as gutils
 from gluoncv.model_zoo import get_model
+from gluoncv.model_zoo.rpn.rpn_target import RPNTargetGenerator
+
 from gluoncv.data import batchify
 from gluoncv.data.transforms.presets.rcnn import FasterRCNNDefaultTrainTransform, \
-    FasterRCNNDefaultValTransform
+    FasterRCNNDefaultValTransform, FasterRCNNDALIPipeline
 from gluoncv.utils.metrics.voc_detection import VOC07MApMetric
 from gluoncv.utils.metrics.coco_detection import COCODetectionMetric
+
+from mxnet.contrib import amp
+
+import horovod.mxnet as hvd
+
+try:
+    from nvidia.dali.plugin.mxnet import DALIGenericIterator
+    dali_found = True
+except ImportError:
+    dali_found = False
 
 
 def parse_args():
@@ -27,6 +41,8 @@ def parse_args():
                         help="Base network name which serves as feature extraction base.")
     parser.add_argument('--dataset', type=str, default='voc',
                         help='Training dataset. Now support voc and coco.')
+    parser.add_argument('--dataset-root', type=str, default='~/.mxnet/datasets/',
+                        help='Path of the directory where the dataset is located.')
     parser.add_argument('--num-workers', '-j', dest='num_workers', type=int,
                         default=4, help='Number of data workers, you can use larger '
                                         'number to accelerate data loading, '
@@ -87,6 +103,14 @@ def parse_args():
                              'Memory usage and speed will decrese.')
     parser.add_argument('--static-alloc', action='store_true',
                         help='Whether to use static memory allocation. Memory usage will increase.')
+    parser.add_argument('--dali', action='store_true',
+                        help='Use DALI for data loading and data preprocessing in training. '
+                        'Currently supports only COCO.')
+    parser.add_argument('--amp', action='store_true',
+                        help='Use MXNet AMP for mixed precision training.')
+    parser.add_argument('--horovod', action='store_true',
+                        help='Use MXNet Horovod for distributed training. Must be run with OpenMPI. '
+                        '--gpus is ignored when using --horovod.')
 
     args = parser.parse_args()
     if args.dataset == 'voc':
@@ -228,6 +252,100 @@ def get_dataloader(net, train_dataset, val_dataset, train_transform, val_transfo
         batch_size, False, batchify_fn=val_bfn, last_batch='keep', num_workers=num_workers)
     return train_loader, val_loader
 
+def get_dali_dataset(dataset_name, devices, args):
+    if dataset_name.lower() == "coco":
+        # training
+        expanded_file_root = os.path.expanduser(args.dataset_root)
+        coco_root = os.path.join(expanded_file_root,
+                                 'coco',
+                                 'train2017')
+        coco_annotations = os.path.join(expanded_file_root,
+                                        'coco',
+                                        'annotations',
+                                        'instances_train2017.json')
+        if args.horovod:
+            train_dataset = [gdata.COCODetectionDALI(num_shards=hvd.size(), shard_id=hvd.rank(), file_root=coco_root,
+                                                     annotations_file=coco_annotations, gpu_decoder=True)]
+        else:
+            train_dataset = [gdata.COCODetectionDALI(num_shards= len(devices), shard_id=i, file_root=coco_root,
+                                                     annotations_file=coco_annotations, gpu_decoder=True) for i, _ in enumerate(devices)]
+
+        # validation
+        if (not args.horovod or hvd.rank() == 0):
+            val_dataset = gdata.COCODetection(root=os.path.join(args.dataset_root + '/coco'),
+                                              splits='instances_val2017',
+                                              skip_empty=False)
+            val_metric = COCODetectionMetric(val_dataset, args.save_prefix + '_eval', cleanup=True)
+        else:
+            val_dataset = None
+            val_metric = None
+    else:
+        raise NotImplementedError('Dataset: {} not implemented with DALI.'.format(dataset_name))
+
+    return train_dataset, val_dataset, val_metric
+
+def get_dali_dataloader(net, train_dataset, val_dataset, global_batch_size, num_workers, devices, ctx, horovod):
+    """ Get DALI dataloader for training and Gluon default
+    dataloader for validation.
+    """
+    # First, we need to generate the anchors
+    ashape=128
+    anchor_generator = copy.deepcopy(net.rpn.anchor_generator)
+        # in case network has reset_ctx to gpu
+    anchor_generator.collect_params().reset_ctx(None)
+    anchors = anchor_generator(
+                mx.nd.zeros((1, 3, ashape, ashape))).reshape((1, 1, ashape, ashape, -1))
+
+    if horovod:
+        batch_size = global_batch_size // hvd.size()
+        pipelines = [FasterRCNNDALIPipeline(device_id=hvd.local_rank(), batch_size=batch_size,
+                                            #TODO(spanev) add anchors here
+                                            anchors=anchors,
+                                            short=net.short,
+                                            max_size=net.max_size,
+                                            num_workers=num_workers,
+                                            dataset_reader = train_dataset[0])]
+    else:
+        num_devices = len(devices)
+        batch_size = global_batch_size // num_devices
+        pipelines = [FasterRCNNDALIPipeline(device_id=device_id, batch_size=batch_size,
+                                            anchors=anchors,
+                                            num_workers=num_workers,
+                                            short=net.short,
+                                            max_size=net.max_size,
+                                            dataset_reader=train_dataset[i])
+                        for i, device_id in enumerate(devices)]
+
+    epoch_size = train_dataset[0].size()
+    if horovod:
+        epoch_size //= hvd.size()
+    train_loader = DALIGenericIterator(pipelines, [('data', DALIGenericIterator.DATA_TAG),
+                                                   ('bboxes', DALIGenericIterator.LABEL_TAG),
+                                                   ('label', DALIGenericIterator.LABEL_TAG)],
+                                                  epoch_size, auto_reset=True,
+                                                  dynamic_shape=True, squeeze_labels=False)
+
+    # validation
+    if (not horovod or hvd.rank() == 0):
+        val_bfn = batchify.Tuple(*[batchify.Append() for _ in range(3)])
+        short = net.short[-1] if isinstance(net.short, (tuple, list)) else net.short
+        val_loader = mx.gluon.data.DataLoader(
+            val_dataset.transform(FasterRCNNDefaultValTransform(short, net.max_size)),
+            batch_size, False, batchify_fn=val_bfn, last_batch='keep', num_workers=num_workers)
+    else:
+        val_loader = None
+
+    num_sample=256
+    pos_iou_thresh=0.7
+    neg_iou_thresh=0.3
+    pos_ratio=0.5
+    box_norm=(1., 1., 1., 1.)
+    target_generator = RPNTargetGenerator(
+            num_sample=num_sample, pos_iou_thresh=pos_iou_thresh,
+            neg_iou_thresh=neg_iou_thresh, pos_ratio=pos_ratio,
+            stds=box_norm)
+
+    return (train_loader, anchors, target_generator), val_loader
 
 def save_params(net, logger, best_map, current_map, epoch, save_interval, prefix):
     current_map = float(current_map)
@@ -300,12 +418,22 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
     """Training pipeline"""
     net.collect_params().setattr('grad_req', 'null')
     net.collect_train_params().setattr('grad_req', 'write')
-    trainer = gluon.Trainer(
-        net.collect_train_params(),  # fix batchnorm, fix first stage, etc...
-        'sgd',
-        {'learning_rate': args.lr,
-         'wd': args.wd,
-         'momentum': args.momentum})
+
+    if args.horovod:
+        hvd.broadcast_parameters(net.collect_params(), root_rank=0)
+        trainer = hvd.DistributedTrainer(
+                        net.collect_train_params(), # fix batchnorm, fix first stage, etc...
+                        'sgd',
+                        {'learning_rate': args.lr, 'wd': args.wd, 'momentum': args.momentum})
+    else:
+        trainer = gluon.Trainer(
+                    net.collect_train_params(), # fix batchnorm, fix first stage, etc...
+                    'sgd',
+                    {'learning_rate': args.lr, 'wd': args.wd, 'momentum': args.momentum},
+                    update_on_kvstore=(False if args.amp else None))
+
+    if args.amp:
+        amp.init_trainer(trainer)
 
     # lr decay policy
     lr_decay = float(args.lr_decay)
@@ -344,6 +472,11 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
         logger.info(net.collect_train_params().keys())
     logger.info('Start training from [Epoch {}]'.format(args.start_epoch))
     best_map = [0]
+    # TODO(spanev): Remove when BoxEncoder is integrated in DALI
+    if args.dali:
+        train_data, target_anchors, target_generator = train_data
+        target_anchors = [target_anchors.as_in_context(c) for c in ctx]
+        feat_sym = net.features(mx.sym.var(name='data'))
     for epoch in range(args.start_epoch, args.epochs):
         mix_ratio = 1.0
         if args.mixup:
@@ -365,6 +498,7 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
         if not args.disable_hybridization:
             net.hybridize(static_alloc=args.static_alloc)
         base_lr = trainer.learning_rate
+
         for i, batch in enumerate(train_data):
             if epoch == 0 and i <= lr_warmup:
                 # adjust based on real percentage
@@ -374,15 +508,41 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                         logger.info(
                             '[Epoch 0 Iteration {}] Set learning rate to {}'.format(i, new_lr))
                     trainer.set_learning_rate(new_lr)
-            batch = split_and_load(batch, ctx_list=ctx)
-            batch_size = len(batch[0])
+
+            if args.dali:
+                data = [d.data[0] for d in batch]
+                bboxes = [d.label[0] for d in batch]
+                labels = [nd.cast(d.label[1], dtype='float32') for d in batch]
+
+                for d in range(len(data)):
+                    _, _, h, w = data[d].shape
+                    bboxes[d][:, :, 0] *= w
+                    bboxes[d][:, :, 1] *= h
+                    bboxes[d][:, :, 2] *= w
+                    bboxes[d][:, :, 3] *= h
+
+                targets = []
+                for datum, bbox, anchor in zip(data, bboxes, target_anchors):
+                    bbox = bbox.squeeze(axis=0)
+                    oshape = feat_sym.infer_shape(data=(1, 3, datum.shape[2], datum.shape[3]))[1][0]
+                    anc = anchor[:, :, :oshape[2], :oshape[3], :].reshape((-1, 4))
+                    targets.append(target_generator(
+                        bbox, anc, datum.shape[3], datum.shape[2]))
+                cls_target, box_target, box_mask = zip(*targets)
+                batch = [data, list(zip(bboxes, labels)), cls_target, box_target, box_mask]
+            else:
+                batch = split_and_load(batch, ctx_list=ctx)
             losses = []
             metric_losses = [[] for _ in metrics]
             add_losses = [[] for _ in metrics2]
             with autograd.record():
                 for data, label, rpn_cls_targets, rpn_box_targets, rpn_box_masks in zip(*batch):
-                    gt_label = label[:, :, 4:5]
-                    gt_box = label[:, :, :4]
+                    if args.dali:
+                        gt_box = label[0]
+                        gt_label = label[1]
+                    else:
+                        gt_label = label[:, :, 4:5]
+                        gt_box = label[:, :, :4]
                     cls_pred, box_pred, roi, samples, matches, rpn_score, rpn_box, anchors = net(
                         data, gt_box)
                     # losses of rpn
@@ -408,41 +568,55 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
                     rcnn_loss = rcnn_loss1 + rcnn_loss2
                     # overall losses
                     losses.append(rpn_loss.sum() * mix_ratio + rcnn_loss.sum() * mix_ratio)
-                    metric_losses[0].append(rpn_loss1.sum() * mix_ratio)
-                    metric_losses[1].append(rpn_loss2.sum() * mix_ratio)
-                    metric_losses[2].append(rcnn_loss1.sum() * mix_ratio)
-                    metric_losses[3].append(rcnn_loss2.sum() * mix_ratio)
-                    add_losses[0].append([[rpn_cls_targets, rpn_cls_targets >= 0], [rpn_score]])
-                    add_losses[1].append([[rpn_box_targets, rpn_box_masks], [rpn_box]])
-                    add_losses[2].append([[cls_targets], [cls_pred]])
-                    add_losses[3].append([[box_targets, box_masks], [box_pred]])
-                autograd.backward(losses)
-                for metric, record in zip(metrics, metric_losses):
-                    metric.update(0, record)
-                for metric, records in zip(metrics2, add_losses):
-                    for pred in records:
-                        metric.update(pred[0], pred[1])
-            trainer.step(batch_size)
+                    if (not args.horovod or hvd.rank() == 0):
+                        metric_losses[0].append(rpn_loss1.sum() * mix_ratio)
+                        metric_losses[1].append(rpn_loss2.sum() * mix_ratio)
+                        metric_losses[2].append(rcnn_loss1.sum() * mix_ratio)
+                        metric_losses[3].append(rcnn_loss2.sum() * mix_ratio)
+                        add_losses[0].append([[rpn_cls_targets, rpn_cls_targets >= 0], [rpn_score]])
+                        add_losses[1].append([[rpn_box_targets, rpn_box_masks], [rpn_box]])
+                        add_losses[2].append([[cls_targets], [cls_pred]])
+                        add_losses[3].append([[box_targets, box_masks], [box_pred]])
+                if args.amp:
+                    with amp.scale_loss(losses, trainer) as scaled_losses:
+                        autograd.backward(scaled_losses)
+                else:
+                    autograd.backward(losses)
+
+                if (not args.horovod or hvd.rank() == 0):
+                    for metric, record in zip(metrics, metric_losses):
+                        metric.update(0, record)
+                    for metric, records in zip(metrics2, add_losses):
+                        for pred in records:
+                            metric.update(pred[0], pred[1])
+            trainer.step(len(losses))
+            if args.horovod:
+                params = net.collect_params()
+                tensors = [p.data() for _,p in sorted(params.items())]
+                for tensor_idx, tensor in enumerate(tensors):
+                    hvd.allreduce_(tensor, average=True, name="param_{}".format(tensor_idx))
             # update metrics
-            if args.log_interval and not (i + 1) % args.log_interval:
+            if (not args.horovod or hvd.rank() == 0) and args.log_interval and not (i + 1) % args.log_interval:
                 # msg = ','.join(['{}={:.3f}'.format(*metric.get()) for metric in metrics])
                 msg = ','.join(['{}={:.3f}'.format(*metric.get()) for metric in metrics + metrics2])
                 logger.info('[Epoch {}][Batch {}], Speed: {:.3f} samples/sec, {}'.format(
-                    epoch, i, args.log_interval * batch_size / (time.time() - btic), msg))
+                    epoch, i, args.log_interval *  args.batch_size / (time.time() - btic), msg))
                 btic = time.time()
 
-        msg = ','.join(['{}={:.3f}'.format(*metric.get()) for metric in metrics])
-        logger.info('[Epoch {}] Training cost: {:.3f}, {}'.format(
-            epoch, (time.time() - tic), msg))
-        if not (epoch + 1) % args.val_interval:
-            # consider reduce the frequency of validation to save time
-            map_name, mean_ap = validate(net, val_data, ctx, eval_metric, args)
-            val_msg = '\n'.join(['{}={}'.format(k, v) for k, v in zip(map_name, mean_ap)])
-            logger.info('[Epoch {}] Validation: \n{}'.format(epoch, val_msg))
-            current_map = float(mean_ap[-1])
-        else:
-            current_map = 0.
-        save_params(net, logger, best_map, current_map, epoch, args.save_interval, args.save_prefix)
+        if (not args.horovod or hvd.rank() == 0):
+            msg = ','.join(['{}={:.3f}'.format(*metric.get()) for metric in metrics])
+            logger.info('[Epoch {}] Training cost: {:.3f}, {}'.format(
+                epoch, (time.time() - tic), msg))
+            if not (epoch + 1) % args.val_interval:
+                # consider reduce the frequency of validation to save time
+                map_name, mean_ap = validate(net, val_data, ctx, eval_metric, args)
+                val_msg = '\n'.join(['{}={}'.format(k, v) for k, v in zip(map_name, mean_ap)])
+                logger.info('[Epoch {}] Validation: \n{}'.format(epoch, val_msg))
+                current_map = float(mean_ap[-1])
+            else:
+                current_map = 0.
+
+            save_params(net, logger, best_map, current_map, epoch, args.save_interval, args.save_prefix)
 
 
 if __name__ == '__main__':
@@ -453,10 +627,23 @@ if __name__ == '__main__':
     # fix seed for mxnet, numpy and python builtin random generator.
     gutils.random.seed(args.seed)
 
+    if args.amp:
+        amp.init()
+
+    if args.horovod:
+        hvd.init()
+
     # training contexts
-    ctx = [mx.gpu(int(i)) for i in args.gpus.split(',') if i.strip()]
-    ctx = ctx if ctx else [mx.cpu()]
-    args.batch_size = len(ctx)  # 1 batch per device
+    if args.horovod:
+        ctx = [mx.gpu(hvd.local_rank())]
+    else:
+        ctx = [mx.gpu(int(i)) for i in args.gpus.split(',') if i.strip()]
+        ctx = ctx if ctx else [mx.cpu()]
+
+    if args.horovod:
+        args.batch_size = hvd.size()
+    else:
+        args.batch_size = len(ctx)  # 1 batch per device
 
     # network
     kwargs = {}
@@ -480,10 +667,20 @@ if __name__ == '__main__':
     net.collect_params().reset_ctx(ctx)
 
     # training data
-    train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
-    train_data, val_data = get_dataloader(
-        net, train_dataset, val_dataset, FasterRCNNDefaultTrainTransform,
-        FasterRCNNDefaultValTransform, args.batch_size, args.num_workers, args.use_fpn)
+    if args.dali:
+        if not dali_found:
+            raise SystemExit("DALI not found, please check if you installed it correctly.")
+        devices = [int(i) for i in args.gpus.split(',') if i.strip()]
+        train_dataset, val_dataset, eval_metric = get_dali_dataset(args.dataset, devices, args)
+        train_data, val_data = get_dali_dataloader(
+            net, train_dataset, val_dataset, args.batch_size, args.num_workers,
+            devices, ctx[0], args.horovod)
+    else:
+        train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
+        batch_size = (args.batch_size // hvd.size()) if args.horovod else args.batch_size
+        train_data, val_data = get_dataloader(
+            net, train_dataset, val_dataset, FasterRCNNDefaultTrainTransform,
+            FasterRCNNDefaultValTransform, batch_size, args.num_workers, args.use_fpn)
 
     # training
     train(net, train_data, val_data, eval_metric, ctx, args)
