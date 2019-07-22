@@ -353,13 +353,20 @@ def ssd_300_resnet34_v1_coco(pretrained=False, pretrained_base=True, **kwargs):
     from ...data import COCODetection
     classes = COCODetection.CLASSES
     return get_ssd('resnet34_v1', 300,
-                   features=['stage3_activation5', 'stage4_activation2'],
-                   filters=[512, 512, 256, 256],
-                   sizes=[51.2, 133.12, 215.04, 296.96, 378.88, 460.8, 542.72],
-                   ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 3 + [[1, 2, 0.5]] * 2,
-                   steps=[16, 32, 64, 128, 256, 512],
-                   classes=classes, dataset='coco', pretrained=pretrained,
-                   pretrained_base=pretrained_base, **kwargs)
+                    #features=['stage3_activation5', 'stage4_activation2'],
+                    features=['stage3_activation5'],
+                    #filters=[512, 512, 256, 256],
+                    filters=[512, 512, 256, 256, 128],
+                    #sizes=[51.2, 133.12, 215.04, 296.96, 378.88, 460.8, 542.72],
+                    sizes=[21, 45, 99, 153, 207, 261, 315],
+                    ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 3 + [[1, 2, 0.5]] * 2,
+                    #steps=[16, 32, 64, 128, 256, 512],
+                    steps=[8, 16, 32, 64, 100, 300],
+                    # added
+                    reduce_ratio=0.5,
+                    classes=classes, dataset='coco', pretrained=pretrained,
+                    pretrained_base=pretrained_base, **kwargs)
+
 
 def ssd_512_resnet50_v1_voc(pretrained=False, pretrained_base=True, **kwargs):
     """SSD architecture with ResNet v1 50 layers.
