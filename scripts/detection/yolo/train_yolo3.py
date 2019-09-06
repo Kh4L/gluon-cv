@@ -16,6 +16,7 @@ from gluoncv.model_zoo import get_model
 from gluoncv.data.batchify import Tuple, Stack, Pad
 from gluoncv.data.transforms.presets.yolo import YOLO3DefaultTrainTransform
 from gluoncv.data.transforms.presets.yolo import YOLO3DefaultValTransform
+from gluoncv.data.transforms.presets.yolo import YOLO3DALIPipeline
 from gluoncv.data.dataloader import RandomTransformDataLoader
 from gluoncv.utils.metrics.voc_detection import VOC07MApMetric
 from gluoncv.utils.metrics.coco_detection import COCODetectionMetric
@@ -24,6 +25,12 @@ from gluoncv.utils import LRScheduler, LRSequential
 from mxnet.contrib import amp
 
 import horovod.mxnet as hvd
+
+try:
+    from nvidia.dali.plugin.mxnet import DALIGenericIterator
+    dali_found = True
+except ImportError:
+    dali_found = False
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train YOLO networks with random input shape.')
@@ -36,6 +43,8 @@ def parse_args():
                         help='Training mini-batch size')
     parser.add_argument('--dataset', type=str, default='voc',
                         help='Training dataset. Now support voc.')
+    parser.add_argument('--dataset-root', type=str, default='~/.mxnet/datasets/',
+                        help='Path of the directory where the dataset is located.')
     parser.add_argument('--num-workers', '-j', dest='num_workers', type=int,
                         default=4, help='Number of data workers, you can use larger '
                         'number to accelerate data loading, if you CPU and GPUs are powerful.')
@@ -97,6 +106,9 @@ def parse_args():
     parser.add_argument('--horovod', action='store_true',
                         help='Use MXNet Horovod for distributed training. Must be run with OpenMPI. '
                         '--gpus is ignored when using --horovod.')
+    parser.add_argument('--dali', action='store_true',
+                        help='Use DALI for data loading and data preprocessing in training. '
+                        'Currently supports only COCO.')
 
     args = parser.parse_args()
     return args
@@ -109,8 +121,8 @@ def get_dataset(dataset, args):
             splits=[(2007, 'test')])
         val_metric = VOC07MApMetric(iou_thresh=0.5, class_names=val_dataset.classes)
     elif dataset.lower() == 'coco':
-        train_dataset = gdata.COCODetection(splits='instances_train2017', use_crowd=False)
-        val_dataset = gdata.COCODetection(splits='instances_val2017', skip_empty=False)
+        train_dataset = gdata.COCODetection(root=args.dataset_root + "/coco", splits='instances_train2017', use_crowd=False)
+        val_dataset = gdata.COCODetection(root=args.dataset_root + "/coco", splits='instances_val2017', skip_empty=False)
         val_metric = COCODetectionMetric(
             val_dataset, args.save_prefix + '_eval', cleanup=True,
             data_shape=(args.data_shape, args.data_shape))
@@ -140,6 +152,76 @@ def get_dataloader(net, train_dataset, val_dataset, data_shape, batch_size, num_
     val_loader = gluon.data.DataLoader(
         val_dataset.transform(YOLO3DefaultValTransform(width, height)),
         batch_size, False, batchify_fn=val_batchify_fn, last_batch='keep', num_workers=num_workers)
+    return train_loader, val_loader
+
+def get_dali_dataset(dataset_name, contexts, args):
+    if dataset_name.lower() == "coco":
+        # training
+        expanded_file_root = os.path.expanduser(args.dataset_root)
+        coco_root = os.path.join(expanded_file_root,
+                                 'coco',
+                                 'train2017')
+        coco_annotations = os.path.join(expanded_file_root,
+                                        'coco',
+                                        'annotations',
+                                        'instances_train2017.json')
+        if args.horovod:
+            train_dataset = [gdata.COCODetectionDALI(num_shards=hvd.size(), shard_id=hvd.rank(),
+                                                     file_root=coco_root,
+                                                     annotations_file=coco_annotations)]
+        else:
+            train_dataset = [gdata.COCODetectionDALI(num_shards=len(contexts), shard_id=i, file_root=coco_root,
+                                                     annotations_file=coco_annotations) for i, _ in enumerate(contexts)]
+
+        # validation
+        if (not args.horovod or hvd.rank() == 0):
+            val_dataset = gdata.COCODetection(root=os.path.join(args.dataset_root + '/coco'),
+                                              splits='instances_val2017',
+                                              skip_empty=False)
+            val_metric = COCODetectionMetric(
+                val_dataset, args.save_prefix + '_eval', cleanup=True,
+                data_shape=(args.data_shape, args.data_shape))
+        else:
+            val_dataset = None
+            val_metric = None
+    else:
+        raise NotImplementedError('Dataset: {} not implemented with DALI.'.format(dataset_name))
+    return train_dataset, val_dataset, val_metric
+
+def get_dali_dataloader(net, train_dataset, val_dataset, data_shape, global_batch_size, num_workers,
+                        contexts, horovod):
+    width, height = data_shape, data_shape
+
+    if horovod:
+        batch_size = global_batch_size // hvd.size()
+        pipelines = [YOLO3DALIPipeline(ctx=contexts[0], batch_size=batch_size,
+                                       data_shape=data_shape, num_workers=num_workers,
+                                       dataset_reader=train_dataset[0], net=net)]
+    else:
+        num_devices = len(contexts)
+        batch_size = global_batch_size // num_devices
+        pipelines = [YOLO3DALIPipeline(ctx=ctx, batch_size=batch_size,
+                                       data_shape=data_shape, num_workers=num_workers,
+                                       dataset_reader=train_dataset[i], net=net) for i, ctx in enumerate(contexts)]
+
+    epoch_size = train_dataset[0].size()
+    if horovod:
+        epoch_size //= hvd.size()
+    train_loader = DALIGenericIterator(pipelines, [('data', DALIGenericIterator.DATA_TAG),
+                                                   ('bboxes', DALIGenericIterator.LABEL_TAG),
+                                                   ('label', DALIGenericIterator.LABEL_TAG)],
+                                                  epoch_size, auto_reset=True)
+
+    # validation
+    if (not horovod or hvd.rank() == 0):
+        val_batchify_fn = Tuple(Stack(), Pad(pad_val=-1))
+        val_loader = gluon.data.DataLoader(
+            val_dataset.transform(YOLO3DefaultValTransform(width, height)),
+            global_batch_size, False, batchify_fn=val_batchify_fn,
+            last_batch='keep', num_workers=num_workers)
+    else:
+        val_loader = None
+
     return train_loader, val_loader
 
 def save_params(net, best_map, current_map, epoch, save_interval, prefix):
@@ -265,10 +347,21 @@ def train(net, train_data, val_data, eval_metric, ctx, args):
         mx.nd.waitall()
         net.hybridize()
         for i, batch in enumerate(train_data):
-            data = gluon.utils.split_and_load(batch[0], ctx_list=ctx, batch_axis=0)
-            # objectness, center_targets, scale_targets, weights, class_targets
-            fixed_targets = [gluon.utils.split_and_load(batch[it], ctx_list=ctx, batch_axis=0) for it in range(1, 6)]
-            gt_boxes = gluon.utils.split_and_load(batch[6], ctx_list=ctx, batch_axis=0)
+            if not args.dali:
+                data = gluon.utils.split_and_load(batch[0], ctx_list=ctx, batch_axis=0)
+                # objectness, center_targets, scale_targets, weights, class_targets
+                fixed_targets = [gluon.utils.split_and_load(batch[it], ctx_list=ctx, batch_axis=0) for it in range(1, 6)]
+                gt_boxes = gluon.utils.split_and_load(batch[6], ctx_list=ctx, batch_axis=0)
+            else:
+                data = [d.data[0] for d in batch]
+                gt_boxes = [d.label[0] for d in batch]
+                labels = [nd.cast(d.label[1], dtype='float32') for d in batch]
+                fixed_targets = []
+                for pipe_id, dali_pipe in enumerate(train_data._pipes):
+                    fixed_targets.append(dali_pipe.get_targets_from_input(gt_boxes[pipe_id],
+                                                                          labels[pipe_id]))
+                fixed_targets = list(zip(*fixed_targets))
+
             sum_losses = []
             obj_losses = []
             center_losses = []
@@ -360,10 +453,18 @@ if __name__ == '__main__':
             async_net.initialize()
 
     # training data
-    batch_size = (args.batch_size // hvd.size()) if args.horovod else args.batch_size
-    train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
-    train_data, val_data = get_dataloader(
-        async_net, train_dataset, val_dataset, args.data_shape, batch_size, args.num_workers, args)
+    if args.dali:
+        if not dali_found:
+            raise SystemExit("DALI not found, please check if you installed it correctly.")
+        train_dataset, val_dataset, eval_metric = get_dali_dataset(args.dataset, ctx, args)
+        train_data, val_data = get_dali_dataloader(
+            async_net, train_dataset, val_dataset, args.data_shape, args.batch_size, args.num_workers,
+            ctx, args.horovod)
+    else:
+        batch_size = (args.batch_size // hvd.size()) if args.horovod else args.batch_size
+        train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
+        train_data, val_data = get_dataloader(
+            async_net, train_dataset, val_dataset, args.data_shape, batch_size, args.num_workers, args)
 
     # training
     train(net, train_data, val_data, eval_metric, ctx, args)
