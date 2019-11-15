@@ -31,6 +31,11 @@ try:
 except ImportError:
     hvd = None
 
+try:
+    from nvidia.dali.plugin.mxnet import DALIGenericIterator
+except ImportError:
+    DALIGenericIterator = None
+
 
 # from mxnet import profiler
 
@@ -40,6 +45,8 @@ def parse_args():
                         help="Base network name which serves as feature extraction base.")
     parser.add_argument('--dataset', type=str, default='coco',
                         help='Training dataset. Now support coco.')
+        parser.add_argument('--dataset-root', type=str, default='~/.mxnet/datasets/',
+                        help='Path of the directory where the dataset is located.')
     parser.add_argument('--num-workers', '-j', dest='num_workers', type=int,
                         default=4, help='Number of data workers, you can use larger '
                                         'number to accelerate data loading, if you CPU and GPUs '
@@ -113,6 +120,9 @@ def parse_args():
     parser.add_argument('--kv-store', type=str, default='nccl',
                         help='KV store options. local, device, nccl, dist_sync, dist_device_sync, '
                              'dist_async are available.')
+    parser.add_argument('--dali', action='store_true',
+                        help='Use DALI for data loading and data preprocessing in training. '
+                        'Currently supports only COCO.')
 
     args = parser.parse_args()
     if args.horovod:
@@ -129,8 +139,10 @@ def parse_args():
 
 def get_dataset(dataset, args):
     if dataset.lower() == 'coco':
-        train_dataset = gdata.COCOInstance(splits='instances_train2017')
-        val_dataset = gdata.COCOInstance(splits='instances_val2017', skip_empty=False)
+        expanded_file_root = os.path.expanduser(args.dataset_root)
+
+        train_dataset = gdata.COCOInstance(root=expanded_file_root + "/coco", splits='instances_train2017')
+        val_dataset = gdata.COCOInstance(root=expanded_file_root + "/coco", splits='instances_val2017', skip_empty=False)
         val_metric = COCOInstanceMetric(val_dataset, args.save_prefix + '_eval', cleanup=True)
     else:
         raise NotImplementedError('Dataset: {} not implemented.'.format(dataset))
