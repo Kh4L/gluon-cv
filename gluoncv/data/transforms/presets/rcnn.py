@@ -378,11 +378,13 @@ class MaskRCNNDefaultTrainTransform(object):
         img, flips = timage.random_flip(img, px=0.5)
         bbox = tbbox.flip(bbox, (w, h), flip_x=flips[0])
         segm = [tmask.flip(polys, (w, h), flip_x=flips[0]) for polys in segm]
+        segm = [[mx.nd.array(poly) for poly in polys] for polys in segm]
 
+        masks = segm
         # gt_masks (n, im_height, im_width) of uint8 -> float32 (cannot take uint8)
-        masks = [mx.nd.array(tmask.to_mask(polys, (w, h))) for polys in segm]
+        #masks = [mx.nd.array(tmask.to_mask(polys, (w, h))) for polys in segm]
         # n * (im_height, im_width) -> (n, im_height, im_width)
-        masks = mx.nd.stack(*masks, axis=0)
+        #masks = mx.nd.stack(*masks, axis=0)
 
         # to tensor
         img = mx.nd.image.to_tensor(img)

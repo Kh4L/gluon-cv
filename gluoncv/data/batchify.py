@@ -486,8 +486,8 @@ class MaskRCNNTrainBatchify(object):
             ' {} elements, given {}.'.format(self.NUM_ELEMENTS, len(data[0]))
         sharded_img, sharded_label, sharded_cls_targets, sharded_box_targets, sharded_box_masks = \
             self._faster_batchify([ele[:5] for ele in data])
-        sharded_masks = self._mask_pad([ele[5] for ele in data])
-
+        #sharded_masks = self._mask_pad([ele[5] for ele in data])
+        sharded_masks = [ele[5] for ele in data]
         return sharded_img, sharded_label, sharded_masks, tuple(
             sharded_cls_targets[:self._num_shards]), \
                tuple(sharded_box_targets[:self._num_shards]), \

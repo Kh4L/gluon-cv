@@ -27,6 +27,7 @@ from gluoncv.model_zoo import get_model
 from gluoncv.data import batchify
 from gluoncv.data.transforms.presets.rcnn import MaskRCNNDefaultTrainTransform, \
     MaskRCNNDefaultValTransform
+from gluoncv.data.transforms.mask import to_mask
 from gluoncv.utils.metrics.coco_instance import COCOInstanceMetric
 from gluoncv.utils.metrics.rcnn import RPNAccMetric, RPNL1LossMetric, RCNNAccMetric, \
     RCNNL1LossMetric, MaskAccMetric, MaskFGAccMetric
@@ -238,7 +239,13 @@ def split_and_load(batch, ctx_list):
     new_batch = []
     for i, data in enumerate(batch):
         if isinstance(data, (list, tuple)):
-            new_data = [x.as_in_context(ctx) for x, ctx in zip(data, ctx_list)]
+            if isinstance(data[0], (list, tuple)): #segmentations
+                if len(ctx_list) == 1:
+                    new_data = [data]
+                else:
+                    new_data = data
+            else:
+                new_data = [x.as_in_context(ctx) for x, ctx in zip(data, ctx_list)]
         else:
             new_data = [data.as_in_context(ctx_list[0])]
         new_batch.append(new_data)
@@ -322,6 +329,26 @@ def get_lr_at_iter(alpha, lr_warmup_factor=1. / 3.):
     return lr_warmup_factor * (1 - alpha) + alpha
 
 
+def get_dali_format_polygons(segmentation_batch, ctx):
+    masks_meta = []
+    masks_coords = []
+    mask_idx = 0
+    offset = 0
+
+    for b in range(len(segmentation_batch)):
+        for n in range(len(segmentation_batch[b])):
+            mask = segmentation_batch[b][n]
+            for poly in mask:
+                masks_meta.append([mask_idx, offset, poly.size])
+                offset += poly.size
+                masks_coords.append(mx.nd.array(poly, dtype='float64'))
+            mask_idx += 1
+    masks_meta = mx.nd.array(masks_meta, dtype='int32', ctx=ctx)
+    masks_coords = mx.nd.concat(*masks_coords, dim=0).as_in_context(ctx)
+
+    return masks_meta, masks_coords
+
+
 class ForwardBackwardTask(Parallelizable):
     def __init__(self, net, optimizer, rpn_cls_loss, rpn_box_loss, rcnn_cls_loss, rcnn_box_loss,
                  rcnn_mask_loss):
@@ -333,9 +360,12 @@ class ForwardBackwardTask(Parallelizable):
         self.rcnn_cls_loss = rcnn_cls_loss
         self.rcnn_box_loss = rcnn_box_loss
         self.rcnn_mask_loss = rcnn_mask_loss
+        self._mask_pad = batchify.Pad(axis=(0, 1, 2), pad_val=0, num_shards=1, ret_length=False)
+
 
     def forward_backward(self, x):
         data, label, gt_mask, rpn_cls_targets, rpn_box_targets, rpn_box_masks = x
+
         with autograd.record():
             gt_label = label[:, :, 4:5]
             gt_box = label[:, :, :4]
@@ -370,7 +400,18 @@ class ForwardBackwardTask(Parallelizable):
             matches = mx.nd.concat(
                 *[mx.nd.take(matches[i], indices[i]) for i in range(indices.shape[0])], dim=0) \
                 .reshape((indices.shape[0], -1))
-            mask_targets, mask_masks = self.net.mask_target(roi, gt_mask, matches, m_cls_targets)
+
+            with autograd.pause():
+                num_cls = self.net.mask_target._num_classes
+                mask_size = self.net.mask_target._mask_size
+
+                masks_meta, masks_coords = get_dali_format_polygons(gt_mask, matches.context)
+                mask_targets, mask_masks = mx.nd.contrib.mrcnn_mask_target(roi, masks_meta, masks_coords,
+                                               matches, m_cls_targets, mask_size=mask_size,
+                                               num_classes=num_cls)
+                mask_targets.wait_to_read()
+
+            # mask_targets, mask_masks = self.net.mask_target(roi, gt_mask, matches, m_cls_targets)
             # loss of mask
             mask_loss = self.rcnn_mask_loss(mask_pred, mask_targets, mask_masks) * \
                         mask_targets.size / mask_masks.sum()
