@@ -9,6 +9,9 @@ import mxnet as mx
 from .. import bbox as tbbox
 from .. import image as timage
 from .. import mask as tmask
+from ....utils import try_import_dali
+
+dali = try_import_dali()
 
 __all__ = ['transform_test', 'load_test',
            'FasterRCNNDefaultTrainTransform', 'FasterRCNNDefaultValTransform',
@@ -468,3 +471,75 @@ class MaskRCNNDefaultValTransform(object):
         img = mx.nd.image.to_tensor(img)
         img = mx.nd.image.normalize(img, mean=self._mean, std=self._std)
         return img, mx.nd.array([img.shape[-2], img.shape[-1], im_scale])
+
+
+
+class MaskRCNNDALITrainPipeline(dali.Pipeline):
+    """DALI Pipeline with Mask RCNN training transform.
+
+    Parameters
+    ----------
+    device_id: int
+         DALI pipeline arg - Device id.
+    num_workers:
+        DALI pipeline arg - Number of CPU workers.
+    batch_size:
+        Batch size.
+    dataset_reader: float
+        Partial pipeline object, which __call__ function has to return
+        (images, bboxes, labels) DALI EdgeReference tuple.
+    short : int, default is 600
+        Resize image shorter side to ``short``.
+        Resize the shorter side of the image randomly within the given range, if it is a tuple.
+    max_size : int, default is 1000
+        Make sure image longer side is smaller than ``max_size``.
+    """
+    def __init__(self, num_workers, device_id, batch_size, dataset_reader, short=600, max_size=1000):
+        super(MaskRCNNDALITrainPipeline, self).__init__(
+            batch_size=batch_size,
+            device_id=device_id,
+            num_threads=num_workers)
+
+        self.dataset_reader = dataset_reader
+
+        self.resize = dali.ops.Resize(
+            device="cpu",
+            max_size=max_size,
+            resize_shorter=short,
+            min_filter=dali.types.DALIInterpType.INTERP_TRIANGULAR)
+
+        # output_dtype = types.FLOAT16 if args.fp16 else types.FLOAT
+        output_dtype = dali.types.FLOAT
+
+        self.normalize = dali.ops.CropMirrorNormalize(
+            device="gpu",
+            # crop=(data_shape, data_shape),
+            mean=[0.485 * 255, 0.456 * 255, 0.406 * 255],
+            std=[0.229 * 255, 0.224 * 255, 0.225 * 255],
+            mirror=0,
+            output_dtype=output_dtype,
+            output_layout=dali.types.NCHW,
+            pad_output=False)
+
+        self.flip = dali.ops.Flip(device="cpu")
+        self.bbflip = dali.ops.BbFlip(device="cpu", ltrb=True)
+        self.flip_coin = dali.ops.CoinFlip(probability=0.5)
+
+    def define_graph(self):
+        """
+        Define the DALI graph.
+        """
+        coin_rnd = self.flip_coin()
+
+        images, bboxes, labels, masks_meta, masks_coords = self.dataset_reader()
+
+        images = self.flip(images, horizontal=coin_rnd)
+        bboxes = self.bbflip(bboxes, horizontal=coin_rnd)
+        images = self.resize(images)
+        images = images.gpu()
+
+        images = self.normalize(images)
+
+        return (images, bboxes.gpu(), labels.gpu(), masks_meta.gpu(), masks_coords.gpu())
+
+      #  return img, bbox.astype(img.dtype), cls_targets, box_targets, box_masks, masks 

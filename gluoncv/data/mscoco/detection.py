@@ -235,9 +235,15 @@ class COCODetectionDALI(object):
         The COCO annotation file to read from.
     device_id: int
          GPU device used for the DALI pipeline.
+    masks: bool, optional, default value: False
+        If True, the partial pipeline returns two more outputs, composing the masks' polygons.
+        For a given sample, the polygons are represented by two tensors:
+        masks_meta -> list of tuples (mask_idx, start_idx, count)
+        masks_coords-> list of (x,y) coordinates
+        More info about it in NVIDIA DALI's COCOReader docs.
     """
 
-    def __init__(self, num_shards, shard_id, file_root, annotations_file, device_id):
+    def __init__(self, num_shards, shard_id, file_root, annotations_file, device_id, masks=False):
         self.input = dali.ops.COCOReader(
             file_root=file_root,
             annotations_file=annotations_file,
@@ -246,7 +252,10 @@ class COCODetectionDALI(object):
             num_shards=num_shards,
             ratio=True,
             ltrb=True,
-            shuffle_after_epoch=True)
+            shuffle_after_epoch=True,
+            masks=masks)
+
+        self.masks = masks
 
         self.decode = dali.ops.ImageDecoder(device="cpu", output_type=dali.types.RGB)
 
@@ -279,9 +288,15 @@ class COCODetectionDALI(object):
         """Returns three DALI graph nodes: inputs, bboxes, labels.
         To be called in `define_graph`.
         """
-        inputs, bboxes, labels = self.input(name="Reader")
+        if not self.masks:
+            inputs, bboxes, labels = self.input(name="Reader")
+        else:
+            inputs, bboxes, labels, masks_meta, masks_coords = self.input(name="Reader")
+
         images = self.decode(inputs)
-        return (images, bboxes, labels)
+        if not self.masks:
+            return (images, bboxes, labels)
+        return (images, bboxes, labels, masks_meta, masks_coords)
 
     def size(self):
         """Returns size of COCO dataset

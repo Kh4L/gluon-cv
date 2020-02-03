@@ -26,13 +26,15 @@ from gluoncv import utils as gutils
 from gluoncv.model_zoo import get_model
 from gluoncv.data import batchify
 from gluoncv.data.transforms.presets.rcnn import MaskRCNNDefaultTrainTransform, \
-    MaskRCNNDefaultValTransform
+    MaskRCNNDefaultValTransform, MaskRCNNDALITrainPipeline
 from gluoncv.data.transforms.mask import to_mask
 from gluoncv.utils.metrics.coco_instance import COCOInstanceMetric
 from gluoncv.utils.metrics.rcnn import RPNAccMetric, RPNL1LossMetric, RCNNAccMetric, \
     RCNNL1LossMetric, MaskAccMetric, MaskFGAccMetric
 from gluoncv.utils.parallel import Parallelizable, Parallel
 from multiprocessing import Process
+
+from gluoncv.model_zoo.rpn.rpn_target import RPNTargetGenerator
 
 try:
     import horovod.mxnet as hvd
@@ -45,6 +47,11 @@ except ImportError:
     logging.info('mpi4py is not installed. Use "pip install --no-cache mpi4py" to install')
     MPI = None
 
+try:
+    from nvidia.dali.plugin.mxnet import DALIGluonIterator
+    dali_found = True
+except ImportError:
+    dali_found = False
 
 # from mxnet import profiler
 
@@ -54,6 +61,8 @@ def parse_args():
                         help="Base network name which serves as feature extraction base.")
     parser.add_argument('--dataset', type=str, default='coco',
                         help='Training dataset. Now support coco.')
+    parser.add_argument('--dataset-root', type=str, default='~/.mxnet/datasets/',
+                        help='Path of the directory where the dataset is located.')
     parser.add_argument('--num-workers', '-j', dest='num_workers', type=int,
                         default=4, help='Number of data workers, you can use larger '
                                         'number to accelerate data loading, if you CPU and GPUs '
@@ -127,6 +136,9 @@ def parse_args():
     parser.add_argument('--horovod', action='store_true',
                         help='Use MXNet Horovod for distributed training. Must be run with OpenMPI. '
                              '--gpus is ignored when using --horovod.')
+    parser.add_argument('--dali', action='store_true',
+                        help='Use DALI for data loading and data preprocessing in training. '
+                        'Currently supports only COCO.')
     parser.add_argument('--use-ext', action='store_true',
                         help='Use NVIDIA MSCOCO API. Make sure you install first')
     parser.add_argument('--executor-threads', type=int, default=1,
@@ -153,8 +165,8 @@ def parse_args():
 
 def get_dataset(dataset, args):
     if dataset.lower() == 'coco':
-        train_dataset = gdata.COCOInstance(splits='instances_train2017')
-        val_dataset = gdata.COCOInstance(splits='instances_val2017', skip_empty=False)
+        train_dataset = gdata.COCOInstance(root=args.dataset_root + "/coco", splits='instances_train2017')
+        val_dataset = gdata.COCOInstance(root=args.dataset_root + "/coco", splits='instances_val2017', skip_empty=False)
         starting_id = 0
         if args.horovod and MPI:
             length = len(val_dataset)
@@ -190,6 +202,80 @@ def get_dataloader(net, train_dataset, val_dataset, train_transform, val_transfo
     val_loader = mx.gluon.data.DataLoader(
         val_dataset.transform(val_transform(short, net.max_size)), num_shards_per_process, False,
         batchify_fn=val_bfn, last_batch='keep', num_workers=args.num_workers)
+    return train_loader, val_loader
+
+def get_dali_dataset(dataset_name, devices, args):
+    if dataset_name.lower() == "coco":
+        # training
+        expanded_file_root = os.path.expanduser(args.dataset_root)
+        coco_root = os.path.join(expanded_file_root,
+                                 'coco',
+                                 'train2017')
+        coco_annotations = os.path.join(expanded_file_root,
+                                        'coco',
+                                        'annotations',
+                                        'instances_train2017.json')
+        if args.horovod:
+            train_dataset = [gdata.COCODetectionDALI(num_shards=hvd.size(), shard_id=hvd.rank(), file_root=coco_root,
+                                                     annotations_file=coco_annotations, device_id=hvd.local_rank(), masks=True)]
+        else:
+            train_dataset = [gdata.COCODetectionDALI(num_shards= len(devices), shard_id=i, file_root=coco_root,
+                                                     annotations_file=coco_annotations, device_id=i, masks=True) for i, _ in enumerate(devices)]
+
+        # validation
+        if (not args.horovod or hvd.rank() == 0):
+            val_dataset = gdata.COCOInstance(root=args.dataset_root + "/coco", splits='instances_val2017', skip_empty=False)
+            starting_id = 0
+            if args.horovod and MPI:
+                length = len(val_dataset)
+                shard_len = length // hvd.size()
+                rest = length % hvd.size()
+                # Compute the start index for this partition
+                starting_id = shard_len * hvd.rank() + min(hvd.rank(), rest)
+            val_metric = COCOInstanceMetric(val_dataset, args.save_prefix + '_eval',
+                                            use_ext=args.use_ext, starting_id=starting_id)
+        else:
+            val_dataset = None
+            val_metric = None
+    else:
+        raise NotImplementedError('Dataset: {} not implemented with DALI.'.format(dataset_name))
+
+    return train_dataset, val_dataset, val_metric
+
+
+def get_dali_dataloader(net, train_dataset, val_dataset, val_transform, batch_size, num_workers, devices, horovod, num_shards_per_process):
+    if horovod:
+        pipelines = [MaskRCNNDALITrainPipeline(device_id=hvd.local_rank(), batch_size=batch_size,
+                                               num_workers=num_workers, dataset_reader=train_dataset[0],
+                                               short=net.short, max_size=net.max_size)]
+    else:
+        pipelines = [MaskRCNNDALITrainPipeline(device_id=device_id, batch_size=batch_size,
+                                               num_workers=num_workers, dataset_reader=train_dataset[i],
+                                               short=net.short, max_size=net.max_size) for i, device_id in enumerate(devices)]
+
+    epoch_size = train_dataset[0].size()
+    if horovod:
+        epoch_size //= hvd.size()
+    train_loader = DALIGluonIterator(pipelines,
+                                     epoch_size,
+                                     [DALIGluonIterator.DENSE_TAG,
+                                      DALIGluonIterator.SPARSE_TAG,
+                                      DALIGluonIterator.SPARSE_TAG,
+                                      DALIGluonIterator.DENSE_TAG,
+                                      DALIGluonIterator.DENSE_TAG,],
+                                     auto_reset=True)
+
+    # validation
+    if (not horovod or hvd.rank() == 0):
+        val_bfn = batchify.Tuple(*[batchify.Append() for _ in range(2)])
+        short = net.short[-1] if isinstance(net.short, (tuple, list)) else net.short
+        # validation use 1 sample per device
+        val_loader = mx.gluon.data.DataLoader(
+            val_dataset.transform(val_transform(short, net.max_size)), num_shards_per_process, False,
+            batchify_fn=val_bfn, last_batch='keep', num_workers=args.num_workers)
+    else:
+        val_loader = None
+
     return train_loader, val_loader
 
 
@@ -351,7 +437,7 @@ def get_dali_format_polygons(segmentation_batch, ctx):
 
 class ForwardBackwardTask(Parallelizable):
     def __init__(self, net, optimizer, rpn_cls_loss, rpn_box_loss, rcnn_cls_loss, rcnn_box_loss,
-                 rcnn_mask_loss):
+                 rcnn_mask_loss, dali):
         super(ForwardBackwardTask, self).__init__()
         self.net = net
         self._optimizer = optimizer
@@ -361,14 +447,88 @@ class ForwardBackwardTask(Parallelizable):
         self.rcnn_box_loss = rcnn_box_loss
         self.rcnn_mask_loss = rcnn_mask_loss
         self._mask_pad = batchify.Pad(axis=(0, 1, 2), pad_val=0, num_shards=1, ret_length=False)
+        self.dali = dali
 
 
     def forward_backward(self, x):
-        data, label, gt_mask, rpn_cls_targets, rpn_box_targets, rpn_box_masks = x
+
+        if self.dali:
+            data, bbox, label, masks_meta, masks_coords = x
+            print(data.shape)
+            print("bbox len {}".format(len(bbox)))
+            print(bbox[0].shape)
+            print("label len {}".format(len(label)))
+            print(label[0].shape)
+            print(masks_meta.shape)
+            print(masks_coords.shape)
+            feat_syms = net.features(mx.sym.var(name='data'))
+            ashape = net.ashape
+            anchors = []  # [P2, P3, P4, P5]
+            # in case network has reset_ctx to gpu
+            anchor_generator = net.rpn.anchor_generator
+            for ag in anchor_generator:
+                zeros = mx.nd.zeros((1, 3, ashape, ashape), ctx=data.context)
+                anchor = ag(zeros).reshape((1, 1, ashape, ashape, -1))
+                ashape = max(ashape // 2, 16)
+                anchors.append(anchor)
+            ref_target_generator = RPNTargetGenerator(
+                    num_sample=256, pos_iou_thresh=0.7,
+                    neg_iou_thresh=0.3, pos_ratio=0.5)
+            anchor_targets = []
+            oshapes = []
+            rpn_cls_targets, rpn_box_targets, rpn_box_masks = [], [], []
+            for anchor, feat_sym in zip(anchors, feat_syms):
+                oshape = feat_sym.infer_shape(data=(1, 3, data.shape[2], data.shape[3]))[1][0]
+                anchor = anchor[:, :, :oshape[2], :oshape[3], :]
+                oshapes.append(anchor.shape)
+                anchor_targets.append(anchor.reshape((-1, 4)))
+            anchor_targets = mx.nd.concat(*anchor_targets, dim=0)
+            _, _, h, w = data.shape
+            gt_bbox = bbox[0]
+            gt_bbox[:, 0] *= w
+            gt_bbox[:, 1] *= h
+            gt_bbox[:, 2] *= w
+            gt_bbox[:, 3] *= h
+            cls_target, box_target, box_mask = mx.nd.contrib.rpn_target(
+                gt_bbox, anchor_targets, (data.shape[3], data.shape[2]),
+                    num_sample=256, pos_iou_thresh=0.7,
+                    neg_iou_thresh=0.3, pos_ratio=0.5)
+            ref_cls_target, ref_box_target, box_mask = ref_target_generator(
+                gt_bbox, anchor_targets, data.shape[3], data.shape[2])
+
+            def print_targets(cls_target):
+                def helper(cls_target, n):
+                    print("{}: {}".format(n,(cls_target == n).sum()))
+                helper(cls_target, -1)
+                helper(cls_target, 0)
+                helper(cls_target, 1)
+            print("new then ref")
+            print_targets(cls_target.asnumpy())
+            print_targets(ref_cls_target)
+            #start_ind = 0
+            #for oshape in oshapes:
+            #    size = oshape[2] * oshape[3] * (oshape[4] // 4)
+            #    lvl_cls_target = cls_target[start_ind:start_ind + size] \
+            #        .reshape(oshape[2], oshape[3], -1)
+            #    lvl_box_target = box_target[start_ind:start_ind + size] \
+            #        .reshape(oshape[2], oshape[3], -1)
+            #    lvl_box_mask = box_mask[start_ind:start_ind + size] \
+            #        .reshape(oshape[2], oshape[3], -1)
+            #    start_ind += size
+            #    rpn_cls_targets.append(lvl_cls_target)
+            #    rpn_box_targets.append(lvl_box_target)
+            #    rpn_box_masks.append(lvl_box_mask)
+            rpn_cls_targets = cls_target
+            rpn_box_targets = box_target
+            rpn_box_masks   = box_mask
+
+            exit()
+        else:
+            data, label, gt_mask, rpn_cls_targets, rpn_box_targets, rpn_box_masks = x
 
         with autograd.record():
-            gt_label = label[:, :, 4:5]
-            gt_box = label[:, :, :4]
+            gt_label = label if args.dali else label[:, :, 4:5]
+            gt_box = bbox if args.dali else label[:, :, :4]
             cls_pred, box_pred, mask_pred, roi, samples, matches, rpn_score, rpn_box, anchors, \
                 cls_targets, box_targets, box_masks, indices = net(data, gt_box, gt_label)
             # losses of rpn
@@ -511,7 +671,7 @@ def train(net, train_data, val_data, eval_metric, batch_size, ctx, logger, args)
         if not args.disable_hybridization:
             net.hybridize(static_alloc=args.static_alloc)
         rcnn_task = ForwardBackwardTask(net, trainer, rpn_cls_loss, rpn_box_loss, rcnn_cls_loss,
-                                        rcnn_box_loss, rcnn_mask_loss)
+                                        rcnn_box_loss, rcnn_mask_loss, args.dali)
         executor = Parallel(args.executor_threads, rcnn_task) if not args.horovod else None
         while lr_steps and epoch >= lr_steps[0]:
             new_lr = trainer.learning_rate * lr_decay
@@ -524,12 +684,16 @@ def train(net, train_data, val_data, eval_metric, batch_size, ctx, logger, args)
         btic = time.time()
         train_data_iter = iter(train_data)
         next_data_batch = next(train_data_iter)
-        next_data_batch = split_and_load(next_data_batch, ctx_list=ctx)
-        for i in range(len(train_data)):
+        if not args.dali:
+            next_data_batch = split_and_load(next_data_batch, ctx_list=ctx)
+            epoch_size = len(train_data)
+        else:
+            epoch_size = train_data.size
+        for i in range(epoch_size):
             batch = next_data_batch
-            if i + epoch * len(train_data) <= lr_warmup:
+            if i + epoch * epoch_size <= lr_warmup:
                 # adjust based on real percentage
-                new_lr = base_lr * get_lr_at_iter((i + epoch * len(train_data)) / lr_warmup,
+                new_lr = base_lr * get_lr_at_iter((i + epoch * epoch_size) / lr_warmup,
                                                   args.lr_warmup_factor)
                 if new_lr != trainer.learning_rate:
                     if i % args.log_interval == 0:
@@ -539,13 +703,21 @@ def train(net, train_data, val_data, eval_metric, batch_size, ctx, logger, args)
             metric_losses = [[] for _ in metrics]
             add_losses = [[] for _ in metrics2]
             if executor is not None:
-                for data in zip(*batch):
-                    executor.put(data)
+                if not args.dali:
+                    for data in zip(*batch):
+                        executor.put(data)
+                else:
+                    for data in batch:
+                        executor.put(data)
+
             for j in range(len(ctx)):
                 if executor is not None:
                     result = executor.get()
                 else:
-                    result = rcnn_task.forward_backward(list(zip(*batch))[0])
+                    if not args.dali:
+                        result = rcnn_task.forward_backward(list(zip(*batch))[0])
+                    else:
+                        result = rcnn_task.forward_backward(batch)
                 if (not args.horovod) or hvd.rank() == 0:
                     for k in range(len(metric_losses)):
                         metric_losses[k].append(result[k])
@@ -554,7 +726,8 @@ def train(net, train_data, val_data, eval_metric, batch_size, ctx, logger, args)
             try:
                 # prefetch next batch
                 next_data_batch = next(train_data_iter)
-                next_data_batch = split_and_load(next_data_batch, ctx_list=ctx)
+                if not args.dali:
+                    next_data_batch = split_and_load(next_data_batch, ctx_list=ctx)
             except StopIteration:
                 pass
 
@@ -646,11 +819,21 @@ if __name__ == '__main__':
         logger.warning('mpi4py is not installed, validation result may be incorrect.')
 
     # training data
-    train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
-    batch_size = args.batch_size // num_gpus if args.horovod else args.batch_size
-    train_data, val_data = get_dataloader(
-        net, train_dataset, val_dataset, MaskRCNNDefaultTrainTransform, MaskRCNNDefaultValTransform,
-        batch_size, len(ctx), args)
+    if args.dali:
+        if not dali_found:
+            raise SystemExit("DALI not found, please check if you installed it correctly.")
+        devices = [int(i) for i in args.gpus.split(',') if i.strip()]
+        train_dataset, val_dataset, eval_metric = get_dali_dataset(args.dataset, devices, args)
+        batch_size = args.batch_size // (hvd.size() if args.horovod else len(devices))
+        train_data, val_data = get_dali_dataloader(
+            net, train_dataset, val_dataset, MaskRCNNDefaultValTransform, batch_size, args.num_workers,
+            devices, args.horovod, len(ctx))
+    else:
+        train_dataset, val_dataset, eval_metric = get_dataset(args.dataset, args)
+        batch_size = args.batch_size // num_gpus if args.horovod else args.batch_size
+        train_data, val_data = get_dataloader(
+            net, train_dataset, val_dataset, MaskRCNNDefaultTrainTransform, MaskRCNNDefaultValTransform,
+            batch_size, len(ctx), args)
 
     # training
     train(net, train_data, val_data, eval_metric, batch_size, ctx, logger, args)
